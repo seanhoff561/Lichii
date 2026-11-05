@@ -46,7 +46,8 @@ public:
     void NoteConstants(std::string json);
     /// Captures the current pass; returns true when copies were recorded.
     bool EndPass();
-    void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written);
+    void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written,
+                         std::string_view written_buffers = {});
     void CapturePresent(ImageView& view);
     /// Waits for pending readbacks and writes them once they pass the staging budget.
     void DrainIfFull();
@@ -59,6 +60,7 @@ private:
         VideoCore::Surface::PixelFormat format;
         u32 width;
         u32 height;
+        u32 depth; // 3D images: every slice is read back, stacked below each other
         s32 level;
         s32 layer;
         GPUVAddr gpu_addr;
@@ -87,6 +89,8 @@ private:
     bool done{};
     bool truncated{};
     std::filesystem::path directory;
+    /// Where the current capture writes: directory itself, or capture-NNN below it in file mode.
+    std::filesystem::path capture_dir;
     std::filesystem::path trigger_file;
     u64 trigger_frame{~0ULL};
     double trigger_seconds{};

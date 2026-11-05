@@ -124,7 +124,8 @@ void AddNVNStorageBuffers(IR::Program& program) {
         }
         const u32 offset{base + index * descriptor_size};
         const auto it{std::ranges::find_if(descs, [=](const StorageBufferDescriptor& desc) {
-            return desc.cbuf_index == driver_cbuf && desc.cbuf_offset == offset;
+            return desc.cbuf_index == driver_cbuf && desc.cbuf_offset == offset &&
+                   !desc.IsIndirect();
         })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;

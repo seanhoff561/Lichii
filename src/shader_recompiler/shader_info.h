@@ -175,6 +175,13 @@ struct StorageBufferDescriptor {
     u32 cbuf_offset;
     u32 count;
     bool is_written;
+    /// When not ~0, the constant buffer word points to a table and the buffer pointer is stored
+    /// at this byte offset into it
+    u32 indirect_offset{~0U};
+
+    [[nodiscard]] bool IsIndirect() const noexcept {
+        return indirect_offset != ~0U;
+    }
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };

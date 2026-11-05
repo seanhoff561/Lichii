@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
@@ -58,6 +60,35 @@
 namespace Vulkan {
 
 namespace {
+// EDEN_NX2_IR_DUMP=<dir>: writes each translated program's IR as text, named by the native program
+// key that also starts EDEN_NX2_SHADER_DUMP's .bin names (<key>-<stage>.ir.txt), once per key.
+void DumpTranslatedIr(const Shader::Environment& env, const Shader::IR::Program& program,
+                      std::string_view stage, u64 unique_hash) try {
+    static const char* const directory = std::getenv("EDEN_NX2_IR_DUMP");
+    if (directory == nullptr || *directory == '\0') {
+        return;
+    }
+    const u64 key = env.NativeProgramKey();
+    std::error_code error;
+    const std::filesystem::path folder{directory};
+    std::filesystem::create_directories(folder, error);
+    // Named by the shader hash the frame dump lists per pass ("shaders"), which cached pipelines
+    // keep too; the native program key (EDEN_NX2_SHADER_DUMP's name) goes on the first line.
+    const auto path = folder / fmt::format("{:016x}-{}.ir.txt", unique_hash, stage);
+    if (std::filesystem::exists(path, error)) {
+        return;
+    }
+    std::string text = fmt::format("// native program key {:016x}\n", key);
+    try {
+        text += Shader::IR::DumpProgram(program);
+    } catch (const std::exception& e) {
+        text = fmt::format("IR dump failed: {}\n", e.what());
+    }
+    std::ofstream file{path};
+    file << text;
+} catch (...) {
+    // Diagnostics only; never let a dump take the shader worker down.
+}
 using Shader::Backend::SPIRV::EmitSPIRV;
 using Shader::Maxwell::ConvertLegacyToGeneric;
 using Shader::Maxwell::GenerateGeometryPassthrough;
@@ -1152,6 +1183,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
         }
+        DumpTranslatedIr(env, programs[index], index == 5 ? "ps" : fmt::format("stage{}", index),
+                         key.unique_hashes[index]);
 
         if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
             LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
@@ -1416,6 +1449,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    DumpTranslatedIr(env, program, "cs", key.unique_hash);
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||

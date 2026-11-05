@@ -993,6 +993,10 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             Id best_index{Const(~0U)};
             Id best_distance{Constant(U64, ~u64{0})};
             for (size_t index = 0; index < num_buffers; ++index) {
+                if (info.storage_buffers_descriptors[index].IsIndirect()) {
+                    // Its base is in guest memory, not the constant buffer
+                    continue;
+                }
                 bases[index] = base_address(index);
                 const Id distance{OpISub(U64, addr, bases[index])};
                 const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
@@ -1001,6 +1005,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
             for (size_t index = 0; index < num_buffers; ++index) {
+                if (info.storage_buffers_descriptors[index].IsIndirect()) {
+                    continue;
+                }
                 access(index, bases[index],
                        OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
             }

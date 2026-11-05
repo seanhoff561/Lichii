@@ -6,7 +6,10 @@
 
 #include <version>
 #if __cpp_lib_chrono >= 201907L
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #endif
@@ -157,6 +160,42 @@ void UpdateGPUAccuracy() {
 
 bool IsGPULevelHigh() {
     return values.current_gpu_accuracy == GpuAccuracy::High;
+}
+
+namespace {
+u32 InitialGPUHighParts() {
+    const char* const value = std::getenv("EDEN_NX2_HIGH_PARTS");
+    return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0;
+}
+std::atomic<u32> gpu_high_parts{InitialGPUHighParts()};
+} // namespace
+
+bool IsGPUHighPart(u32 part) {
+    return IsGPULevelHigh() || (gpu_high_parts.load(std::memory_order_relaxed) & part) != 0;
+}
+
+u32 GPUHighParts() {
+    return gpu_high_parts.load(std::memory_order_relaxed);
+}
+
+void PollGPUHighParts() {
+    static const char* const file = std::getenv("EDEN_NX2_HIGH_PARTS_FILE");
+    static u32 tick = 0;
+    if (file == nullptr || *file == 0 || ++tick % 15 != 0) {
+        return;
+    }
+    std::FILE* const handle = std::fopen(file, "rb");
+    if (handle == nullptr) {
+        return;
+    }
+    char text[32]{};
+    const size_t read = std::fread(text, 1, sizeof(text) - 1, handle);
+    std::fclose(handle);
+    text[read] = 0;
+    const u32 parts = static_cast<u32>(std::strtoul(text, nullptr, 0));
+    if (gpu_high_parts.exchange(parts, std::memory_order_relaxed) != parts) {
+        LOG_INFO(Config, "Accurate GPU parts now {:#x}", parts);
+    }
 }
 
 bool IsDMALevelDefault() {

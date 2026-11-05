@@ -81,6 +81,9 @@ public:
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
 
+    /// Native programs: the key that names EDEN_NX2_SHADER_DUMP's files (0 when none).
+    [[nodiscard]] virtual u64 NativeProgramKey() const { return 0; }
+
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }

@@ -210,7 +210,7 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         return std::nullopt;
     }
     const auto& info = image->info;
-    if (info.type == VideoCommon::ImageType::e3D || info.type == VideoCommon::ImageType::Buffer ||
+    if (info.type == VideoCommon::ImageType::Buffer ||
         GetFormatType(info.format) != SurfaceType::ColorTexture ||
         DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1) {
         return std::nullopt;
@@ -220,6 +220,7 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
     const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
     const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
     const u32 level = static_cast<u32>(view.range.base.level);
+    const bool volume = info.type == VideoCommon::ImageType::e3D;
     return Target{
         .slot = slot,
         .image = image->Handle(),
@@ -227,8 +228,9 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
                                                                            : info.format,
         .width = std::max(1U, width >> level),
         .height = std::max(1U, height >> level),
+        .depth = volume ? std::max(1U, info.size.depth >> level) : 1U,
         .level = view.range.base.level,
-        .layer = view.range.base.layer,
+        .layer = volume ? 0 : view.range.base.layer,
         .gpu_addr = image->gpu_addr,
         .rescaled = rescaled,
         .msaa = info.num_samples > 1,
@@ -304,8 +306,14 @@ bool FrameDump::EndPass() {
     return recorded;
 }
 
-void FrameDump::CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written) {
+void FrameDump::CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written,
+                                std::string_view written_buffers) {
     const u32 dispatch = dispatches++;
+    // Every dispatch gets a line with the storage buffers it writes, images or not.
+    manifest << fmt::format(
+                    R"({{"kind":"dispatch_info","dispatch":{},"after_draws":{},"shaders":["{:016x}"],"ssbo_w":[{}]}})",
+                    dispatch, draws, shader_hash, written_buffers)
+             << '\n';
     for (u32 slot = 0; slot < written.size(); ++slot) {
         const auto target = written[slot] ? MakeTarget(*written[slot], slot) : std::nullopt;
         if (!target) {
@@ -327,13 +335,14 @@ void FrameDump::CapturePresent(ImageView& view) {
 }
 
 bool FrameDump::Record(const Target& target, std::string name, std::string tags) {
-    name += fmt::format("_{}_{}x{}_{:x}", target.format, target.width, target.height,
+    name += fmt::format("_{}_{}x{}{}_{:x}", target.format, target.width, target.height,
+                        target.depth > 1 ? fmt::format("x{}", target.depth) : "",
                         target.gpu_addr);
     if (target.msaa) {
         manifest << fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags) << '\n';
         return false;
     }
-    const size_t size = size_t{target.width} * target.height *
+    const size_t size = size_t{target.width} * target.height * target.depth *
                         VideoCore::Surface::BytesPerBlock(target.format);
     if (written_bytes + pending_bytes + size > SIZE_CAP) {
         truncated = true;
@@ -358,7 +367,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
             .layerCount = 1,
         },
         .imageOffset{0, 0, 0},
-        .imageExtent{target.width, target.height, 1},
+        .imageExtent{target.width, target.height, target.depth},
     };
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([image = target.image, destination = *buffer, copy](vk::CommandBuffer cmdbuf) {
@@ -381,7 +390,14 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
                                after);
     });
     pending_bytes += size;
-    readbacks.push_back({std::move(buffer), target, std::move(name), std::move(tags)});
+    // The slices are packed one after another: write them as one tall image.
+    Target stacked = target;
+    stacked.height *= target.depth;
+    if (target.depth > 1) {
+        tags += fmt::format(R"(,"depth":{},"slice_height":{})", target.depth, target.height);
+    }
+    stacked.depth = 1;
+    readbacks.push_back({std::move(buffer), stacked, std::move(name), std::move(tags)});
     return true;
 }
 
@@ -488,7 +504,7 @@ void FrameDump::Write(const Readback& readback, std::span<const u8> mapped) {
 }
 
 void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
-    std::ofstream file{directory / name, std::ios::binary};
+    std::ofstream file{capture_dir / name, std::ios::binary};
     file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     written_bytes += data.size();
 }
@@ -510,8 +526,23 @@ void FrameDump::TickFrame() {
         done = true;
         LOG_INFO(Render_Vulkan,
                  "Frame dump done: {} images, {} passes, {} draws, {} dispatches, {} MiB in {}{}",
-                 images, pass_index, draws, dispatches, written_bytes >> 20, directory.string(),
+                 images, pass_index, draws, dispatches, written_bytes >> 20, capture_dir.string(),
                  truncated ? " (stopped at the 500 MiB cap)" : "");
+        if (!trigger_file.empty()) {
+            // File mode stays armed: each capture.now takes another frame into its own folder.
+            done = false;
+            truncated = false;
+            readbacks.clear();
+            pending_bytes = written_bytes = 0;
+            sequence = images = 0;
+            pass_framebuffer = nullptr;
+            pass_targets.clear();
+            pass_hashes.clear();
+            pass_programs.clear();
+            pass_constants.clear();
+            pass_constants_set = false;
+            pass_index = pass_first_draw = draws = dispatches = 0;
+        }
         return;
     }
     const double elapsed =
@@ -522,18 +553,29 @@ void FrameDump::TickFrame() {
          !std::filesystem::exists(trigger_file, error))) {
         return;
     }
-    std::filesystem::create_directories(directory, error);
-    manifest.open(directory / "manifest.jsonl", std::ios::trunc);
+    capture_dir = directory;
+    if (!trigger_file.empty()) {
+        // Consume the trigger, and never overwrite an earlier capture.
+        std::filesystem::remove(trigger_file, error);
+        for (u32 index = 1;; ++index) {
+            capture_dir = directory / fmt::format("capture-{:03}", index);
+            if (!std::filesystem::exists(capture_dir, error)) {
+                break;
+            }
+        }
+    }
+    std::filesystem::create_directories(capture_dir, error);
+    manifest.open(capture_dir / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {
-        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
+        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", capture_dir.string());
         done = true;
         return;
     }
-    manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
+    manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f},"high_parts":{}}})", frame, elapsed, Settings::GPUHighParts())
              << '\n';
     capturing = true;
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot) into {}", frame,
-             elapsed, directory.string());
+             elapsed, capture_dir.string());
 }
 
 } // namespace Vulkan

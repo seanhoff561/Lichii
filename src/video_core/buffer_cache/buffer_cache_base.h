@@ -233,6 +233,17 @@ public:
 
     void TickFrame();
 
+    /// Calls func(gpu_addr, size) for each storage buffer the bound compute shader writes.
+    template <typename Func>
+    void ForEachWrittenComputeStorage(Func&& func) const {
+        ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
+            if (((channel_state->written_compute_storage_buffers >> index) & 1) != 0) {
+                const Binding& binding = channel_state->compute_storage_buffers[index];
+                func(binding.gpu_addr, binding.size);
+            }
+        });
+    }
+
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool);
 
@@ -285,7 +296,7 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written);
+                                   bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -295,7 +306,7 @@ public:
     void UnbindComputeStorageBuffers();
 
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindComputeTextureBuffers();
 
@@ -519,6 +530,9 @@ private:
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written, bool native_pointer = false) const;
+
+    [[nodiscard]] GPUVAddr IndirectStorageBufferSlot(GPUVAddr cbuf_slot,
+                                                     u32 indirect_offset) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);

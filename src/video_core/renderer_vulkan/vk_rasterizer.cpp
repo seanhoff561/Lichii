@@ -449,8 +449,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 if (!cbuf.enabled || cbuf.address == 0 || cbuf.size == 0) {
                     continue;
                 }
-                std::array<u32, 128> words{};
-                const size_t bytes = std::min<size_t>(cbuf.size & ~3U, sizeof(words));
+                // EDEN_NX2_FRAME_DUMP_CBUF_BYTES: how much of each buffer to keep (512 default).
+                static const size_t limit = [] {
+                    const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_CBUF_BYTES");
+                    const size_t wanted = value ? std::strtoull(value, nullptr, 0) : 512;
+                    return std::clamp<size_t>(wanted & ~size_t{3}, 4, 65536);
+                }();
+                std::vector<u32> words(limit / 4);
+                const size_t bytes = std::min<size_t>(cbuf.size & ~3U, limit);
                 if (bytes == 0 || !gpu_memory->IsFullyMappedRange(cbuf.address, bytes)) {
                     continue;
                 }
@@ -1350,7 +1356,11 @@ void RasterizerVulkan::DispatchCompute() {
         for (const VideoCommon::ImageViewId id : pipeline->WrittenImages()) {
             written.push_back(&texture_cache.GetImageView(id));
         }
-        frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
+        std::string buffers;
+        buffer_cache.ForEachWrittenComputeStorage([&](GPUVAddr address, u32 size) {
+            buffers += fmt::format(R"({}["{:x}",{}])", buffers.empty() ? "" : ",", address, size);
+        });
+        frame_dump.CaptureDispatch(pipeline->ShaderHash(), written, buffers);
     };
 
     const auto& qmd{kepler_compute->launch_description};
@@ -1501,7 +1511,7 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
             return true;
         }
     }
-    if (!Settings::IsGPULevelHigh()) {
+    if (!Settings::IsGPUHighPart(Settings::GpuHighPart::TextureFlush)) {
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
@@ -1670,7 +1680,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
-    if (Settings::IsGPULevelHigh()) {
+    if (Settings::IsGPUHighPart(Settings::GpuHighPart::RegionFlush)) {
         FlushRegion(addr, size, which);
     }
     InvalidateRegion(addr, size, which);
@@ -1814,6 +1824,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    Settings::PollGPUHighParts();
     frame_dump.TickFrame();
     ++render_trace_frame;
     render_trace_draws = 0;

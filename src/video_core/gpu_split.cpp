@@ -98,7 +98,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // The front reads command lists straight from guest memory; a read that flushes the caches
     // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
     // mid-game: hand the engines back to the front (and start again when they allow it).
-    const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
+    const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPUHighPart(Settings::GpuHighPart::SafeDma)
                                                           : Settings::IsDMALevelSafe();
     const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;

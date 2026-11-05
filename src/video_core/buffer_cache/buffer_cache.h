@@ -585,7 +585,8 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
-                                               u32 cbuf_offset, bool is_written) {
+                                               u32 cbuf_offset, bool is_written,
+                                               u32 indirect_offset) {
     if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
         LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
                   stage, ssbo_index);
@@ -613,9 +614,14 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     }
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
-    const GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+    GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
+    const bool indirect = indirect_offset != ~0U;
+    if (indirect) {
+        ssbo_addr = IndirectStorageBufferSlot(ssbo_addr, indirect_offset);
+    }
     channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written);
+        ssbo_addr == 0 ? NULL_BINDING
+                       : StorageBufferBinding(ssbo_addr, cbuf_index, is_written, indirect);
     return (channel_state->storage_buffers[stage][ssbo_index].buffer_id != NULL_BUFFER_ID);
 }
 
@@ -657,7 +663,7 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
 
 template <class P>
 void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                              bool is_written) {
+                                              bool is_written, u32 indirect_offset) {
     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
                   ssbo_index);
@@ -692,9 +698,15 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     ASSERT(((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) != 0);
 
     const auto& cbufs = launch_desc.const_buffer_config;
-    const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
+    GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
+    const bool indirect = indirect_offset != ~0U;
+    if (indirect) {
+        ssbo_addr = IndirectStorageBufferSlot(ssbo_addr, indirect_offset);
+    }
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode());
+        ssbo_addr == 0 ? NULL_BINDING
+                       : StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
+                                              indirect || kepler_compute->IsNativeMode());
 }
 
 template <class P>
@@ -2626,6 +2638,17 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
         }
     }
     channel_state->has_deleted_buffers = true;
+}
+
+template <class P>
+GPUVAddr BufferCache<P>::IndirectStorageBufferSlot(GPUVAddr cbuf_slot, u32 indirect_offset) const {
+    // The constant buffer holds a pointer to a table of buffer pointers; the buffer's pointer is
+    // the table entry at indirect_offset.
+    const GPUVAddr table = gpu_memory->Read<u64>(cbuf_slot);
+    if (table == 0 || !gpu_memory->IsFullyMappedRange(table + indirect_offset, sizeof(u64))) {
+        return 0;
+    }
+    return table + indirect_offset;
 }
 
 template <class P>

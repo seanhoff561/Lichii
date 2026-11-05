@@ -9,7 +9,8 @@ namespace Shader::Backend {
 [[nodiscard]] inline bool UsesNvnStorageDescriptor(const Info& info,
                                                     const StorageBufferDescriptor& descriptor) {
     constexpr u32 descriptor_size = 0x10;
-    if (descriptor.cbuf_index != 0 || descriptor.cbuf_offset < info.nvn_buffer_base) {
+    if (descriptor.IsIndirect() || descriptor.cbuf_index != 0 ||
+        descriptor.cbuf_offset < info.nvn_buffer_base) {
         return false;
     }
     const u32 offset = descriptor.cbuf_offset - info.nvn_buffer_base;

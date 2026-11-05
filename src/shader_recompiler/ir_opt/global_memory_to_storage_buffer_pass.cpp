@@ -34,6 +34,9 @@ struct StorageBufferAddr {
 
     u32 index;
     u32 offset;
+    /// Byte offset into the table the constant buffer word points to, where the buffer's own
+    /// pointer is stored; ~0 when the constant buffer word is the buffer pointer itself.
+    u32 indirect{~0U};
 };
 
 /// Block iterator to a global memory instruction and the storage buffer it uses
@@ -41,6 +44,8 @@ struct StorageInst {
     StorageBufferAddr storage_buffer;
     IR::Inst* inst;
     IR::Block* block;
+    /// Low word of the pointer loaded from memory, for indirect buffers
+    IR::Inst* pointer_low{};
 };
 
 /// Bias towards a certain range of constant buffers when looking for storage buffers
@@ -1059,6 +1064,96 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
     return candidates;
 }
 
+/// Finds a buffer reached through a pointer that is itself loaded from memory: the low address is
+/// the low word of a 64-bit load (plus 32-bit terms) and that load's own address is a constant
+/// buffer pointer plus an immediate. The binding reads the table pointer from the constant buffer
+/// and the buffer pointer from the table, so the access becomes a storage buffer access. Without
+/// this the access stays global and reads zero when no bound buffer contains it.
+std::optional<std::pair<StorageBufferAddr, IR::Inst*>> TrackIndirectPointer(
+    const LowAddrInfo& addr) {
+    IR::Inst* pointer_low{};
+    bool ambiguous{};
+    const auto is_load_word = [](const IR::Inst* inst, u32 element) -> IR::Inst* {
+        if (inst->GetOpcode() != IR::Opcode::CompositeExtractU32x2 ||
+            !inst->Arg(1).IsImmediate() || inst->Arg(1).U32() != element ||
+            inst->Arg(0).IsImmediate()) {
+            return nullptr;
+        }
+        IR::Inst* const load{inst->Arg(0).InstRecursive()};
+        return load->GetOpcode() == IR::Opcode::LoadGlobal64 ? load : nullptr;
+    };
+    const auto visit_low{[&](const auto& self, const IR::Value& term) -> void {
+        if (term.IsImmediate() || ambiguous) {
+            return;
+        }
+        IR::Inst* const inst{term.InstRecursive()};
+        if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+            self(self, inst->Arg(0));
+            self(self, inst->Arg(1));
+            return;
+        }
+        if (is_load_word(inst, 0)) {
+            ambiguous = pointer_low != nullptr && pointer_low != inst;
+            pointer_low = inst;
+        }
+    }};
+    visit_low(visit_low, addr.value);
+    if (ambiguous || !pointer_low) {
+        return std::nullopt;
+    }
+    IR::Inst* const load{pointer_low->Arg(0).InstRecursive()};
+    // The high half has to come from the same pointer
+    bool high_matches{};
+    const auto visit_high{[&](const auto& self, const IR::Value& term, u32 depth) -> void {
+        if (term.IsImmediate() || high_matches || depth > 4) {
+            return;
+        }
+        const IR::Inst* const inst{term.InstRecursive()};
+        if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+            self(self, inst->Arg(0), depth + 1);
+            self(self, inst->Arg(1), depth + 1);
+            return;
+        }
+        high_matches = is_load_word(inst, 1) == load;
+    }};
+    visit_high(visit_high, addr.high, 0);
+    if (!high_matches) {
+        return std::nullopt;
+    }
+    // The table entry's address: one constant buffer pointer plus immediates
+    const std::optional<LowAddrInfo> table_addr{TrackLowAddress(load)};
+    if (!table_addr) {
+        return std::nullopt;
+    }
+    std::optional<StorageBufferAddr> table;
+    s64 entry{table_addr->imm_offset};
+    bool invalid{};
+    const auto visit_table{[&](const auto& self, const IR::Value& term) -> void {
+        if (invalid) {
+            return;
+        }
+        if (term.IsImmediate()) {
+            entry += static_cast<s32>(term.U32());
+            return;
+        }
+        const IR::Inst* const inst{term.InstRecursive()};
+        if (inst->GetOpcode() == IR::Opcode::IAdd32) {
+            self(self, inst->Arg(0));
+            self(self, inst->Arg(1));
+            return;
+        }
+        const std::optional<StorageBufferAddr> word{CbufWord(inst)};
+        invalid = !word || table.has_value() || !Common::IsAligned(word->offset, 8);
+        table = word;
+    }};
+    visit_table(visit_table, table_addr->value);
+    if (invalid || !table || entry < 0 || entry >= 0x10000 || entry % 8 != 0) {
+        return std::nullopt;
+    }
+    table->indirect = static_cast<u32>(entry);
+    return std::make_pair(*table, pointer_low);
+}
+
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env,
                            const TrackingConditions& conditions) {
@@ -1110,6 +1205,21 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             // aligned slots, so for a pointer at an 8-byte slot it can return a dimension or stride
             // the address arithmetic reads instead, and the access then lands in the wrong buffer.
             storage_buffer = candidates.front();
+        }
+    }
+    if (!storage_buffer) {
+        if (const auto indirect{TrackIndirectPointer(*low_addr_info)}) {
+            if (IsGlobalMemoryWrite(inst)) {
+                info.writes.insert(indirect->first);
+            }
+            info.set.insert(indirect->first);
+            info.to_replace.push_back(StorageInst{
+                .storage_buffer{indirect->first},
+                .inst = &inst,
+                .block = &block,
+                .pointer_low = indirect->second,
+            });
+            return;
         }
     }
     if (native && !storage_buffer) {
@@ -1167,7 +1277,8 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
 }
 
 /// Returns the offset in indices (not bytes) for an equivalent storage instruction
-IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment) {
+IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer, u32 alignment,
+                      IR::Inst* pointer_low = nullptr) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     IR::U32 offset;
     if (const std::optional<LowAddrInfo> low_addr{TrackLowAddress(&inst)}) {
@@ -1180,7 +1291,8 @@ IR::U32 StorageOffset(IR::Block& block, IR::Inst& inst, StorageBufferAddr buffer
     }
     // Subtract the least significant 32 bits from the guest offset. The result is the storage
     // buffer offset in bytes.
-    IR::U32 low_cbuf{ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))};
+    IR::U32 low_cbuf{pointer_low ? IR::U32{IR::Value{pointer_low}}
+                                 : ir.GetCbuf(ir.Imm32(buffer.index), ir.Imm32(buffer.offset))};
 
     // Align the offset base to match the host alignment requirements
     low_cbuf = ir.BitwiseAnd(low_cbuf, ir.Imm32(~(alignment - 1U)));
@@ -1308,6 +1420,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .cbuf_offset = storage_buffer.offset,
             .count = 1,
             .is_written = info.writes.contains(storage_buffer),
+            .indirect_offset = storage_buffer.indirect,
         });
     }
     for (const StorageInst& storage_inst : info.to_replace) {
@@ -1317,7 +1430,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         IR::Block* const block{storage_inst.block};
         IR::Inst* const inst{storage_inst.inst};
         const IR::U32 offset{
-            StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment))};
+            StorageOffset(*block, *inst, storage_buffer, u32(host_info.min_ssbo_alignment),
+                          storage_inst.pointer_low)};
         Replace(*block, *inst, index, offset);
     }
 }
@@ -1329,7 +1443,8 @@ void JoinStorageInfo(Info& base, Info& source) {
     for (auto& desc : source.storage_buffers_descriptors) {
         auto it{std::ranges::find_if(descriptors, [&desc](const auto& existing) {
             return desc.cbuf_index == existing.cbuf_index &&
-                   desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count;
+                   desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count &&
+                   desc.indirect_offset == existing.indirect_offset;
         })};
         if (it != descriptors.end()) {
             it->is_written |= desc.is_written;

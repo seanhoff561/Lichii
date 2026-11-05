@@ -982,6 +982,23 @@ bool GetDebugKnobAt(u8 i);
 void UpdateGPUAccuracy();
 bool IsGPULevelHigh();
 
+// Single pieces of accurate GPU mode, for finding which one a game needs without paying for all
+// of them. IsGPUHighPart(part) is true in accurate mode or when that part's bit is set:
+// EDEN_NX2_HIGH_PARTS=<mask> at start, or the file named by EDEN_NX2_HIGH_PARTS_FILE (polled).
+namespace GpuHighPart {
+constexpr u32 MacroParams = 1u << 0;     // re-read macro parameters from guest memory
+constexpr u32 QueryWriteOrder = 1u << 1; // payload semaphores wait for their fence
+constexpr u32 FenceDelay = 1u << 2;      // fences wait for flushes; queries stay unsynced
+constexpr u32 ThreadFlush = 1u << 3;     // CPU flush+invalidate requests flush the GPU caches
+constexpr u32 TextureFlush = 1u << 4;    // CPU reads of GPU-written textures flush them
+constexpr u32 RegionFlush = 1u << 5;     // rasterizer flush+invalidate flushes first
+constexpr u32 PreciseQuery = 1u << 6;    // occlusion queries count samples exactly
+constexpr u32 SafeDma = 1u << 7;         // command list reads flush the caches first
+} // namespace GpuHighPart
+bool IsGPUHighPart(u32 part);
+u32 GPUHighParts();
+void PollGPUHighParts();
+
 bool IsDMALevelDefault();
 bool IsDMALevelSafe();
 

@@ -172,7 +172,7 @@ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
 }
 
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
-    if (Settings::IsGPULevelHigh()) {
+    if (Settings::IsGPUHighPart(Settings::GpuHighPart::ThreadFlush)) {
         if (!is_async) {
             PushCommand(FlushRegionCommand(addr, size), false, is_async);
         } else {

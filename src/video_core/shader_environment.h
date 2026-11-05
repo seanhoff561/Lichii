@@ -87,6 +87,10 @@ public:
         return lowered_native;
     }
 
+    [[nodiscard]] u64 NativeProgramKey() const override {
+        return lowered_native ? lowered_native->native_program_key : 0;
+    }
+
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
     [[nodiscard]] u64 CalculateHash() const;
