@@ -539,16 +539,93 @@ bool Enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+constexpr size_t UnwindFrames = 32;
+
+/// The executable's unwind entry for an address, looked up in its own exception directory: no
+/// loader lock (the suspended thread could hold it).
+const RUNTIME_FUNCTION* FindFunction(u64 base, const RUNTIME_FUNCTION* functions, size_t count,
+                                     u64 address) {
+    const u32 rva = static_cast<u32>(address - base);
+    size_t low = 0;
+    size_t high = count;
+    while (low < high) {
+        const size_t mid = (low + high) / 2;
+        if (rva < functions[mid].BeginAddress) {
+            high = mid;
+        } else if (rva >= functions[mid].EndAddress) {
+            low = mid + 1;
+        } else {
+            return &functions[mid];
+        }
+    }
+    return nullptr;
+}
+
+/// Walks a suspended thread's executable frames with the x64 unwind data. Starting outside the
+/// executable (driver, system), it resumes at the first stack word that returns into it. Returns
+/// the number of frames (executable offsets) written; a fault reading a bad stack ends the walk.
+size_t Unwind(CONTEXT context, u64 base, u64 end, const RUNTIME_FUNCTION* functions, size_t count,
+              u64 stack_limit, u64* out) {
+    size_t frames = 0;
+    __try {
+        if (context.Rip < base || context.Rip >= end) {
+            // Find a return address into the executable on the stack.
+            bool found = false;
+            for (u64 slot = context.Rsp; slot < context.Rsp + 0x800 && slot + 8 <= stack_limit;
+                 slot += 8) {
+                const u64 value = *reinterpret_cast<const u64*>(slot);
+                if (value > base && value < end &&
+                    FindFunction(base, functions, count, value) != nullptr) {
+                    context.Rip = value;
+                    context.Rsp = slot + 8;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return 0;
+            }
+        }
+        while (frames < UnwindFrames && context.Rip >= base && context.Rip < end) {
+            out[frames++] = context.Rip - base;
+            const RUNTIME_FUNCTION* const function =
+                FindFunction(base, functions, count, context.Rip);
+            if (function == nullptr) {
+                // A leaf function: the return address is on top of the stack.
+                context.Rip = *reinterpret_cast<const u64*>(context.Rsp);
+                context.Rsp += 8;
+                continue;
+            }
+            PVOID handler_data{};
+            DWORD64 establisher{};
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, context.Rip,
+                             const_cast<PRUNTIME_FUNCTION>(function), &context, &handler_data,
+                             &establisher, nullptr);
+            if (context.Rsp == 0 || context.Rsp >= stack_limit) {
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return frames;
+}
+
 void Run() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     const u64 base = reinterpret_cast<u64>(&__ImageBase);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
         reinterpret_cast<const u8*>(&__ImageBase) + __ImageBase.e_lfanew);
     const u64 end = base + nt->OptionalHeader.SizeOfImage;
+    const auto& exceptions =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    const auto* const functions =
+        reinterpret_cast<const RUNTIME_FUNCTION*>(base + exceptions.VirtualAddress);
+    const size_t function_count = exceptions.Size / sizeof(RUNTIME_FUNCTION);
     struct Profile {
         u64 samples{};
         std::unordered_map<u64, u32> leaf;
         std::unordered_map<u64, u32> stack;
+        std::unordered_map<u64, u32> edges; ///< (frame << 32) | its caller's frame
     };
     std::map<std::string, Profile> profiles;
     std::vector<SampledThread> threads;
@@ -565,14 +642,23 @@ void Run() {
                 continue;
             }
             CONTEXT context{};
-            context.ContextFlags = CONTEXT_CONTROL;
+            context.ContextFlags = CONTEXT_FULL;
             const bool got = GetThreadContext(thread.handle, &context) != 0;
-            SIZE_T read = 0;
+            u64 unwound[UnwindFrames];
+            size_t unwound_count = 0;
             if (got) {
-                ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(context.Rsp), words,
-                                  sizeof(words), &read);
+                // The stack's upper bound, from its committed region.
+                MEMORY_BASIC_INFORMATION region{};
+                u64 stack_limit = context.Rsp + 0x100000;
+                if (VirtualQuery(reinterpret_cast<void*>(context.Rsp), &region, sizeof(region))) {
+                    stack_limit = reinterpret_cast<u64>(region.BaseAddress) + region.RegionSize;
+                }
+                unwound_count = Unwind(context, base, end, functions, function_count,
+                                       stack_limit, unwound);
             }
             ResumeThread(thread.handle);
+            (void)words;
+            SIZE_T read = 0;
             if (!got) {
                 continue;
             }
@@ -580,21 +666,18 @@ void Run() {
             ++profile.samples;
             const u64 rip = context.Rip;
             ++profile.leaf[rip >= base && rip < end ? rip - base : 1];
-            u64 seen[CallerFrames]{};
-            size_t frames = 0;
-            for (size_t i = 0; i < read / sizeof(u64) && frames < CallerFrames; ++i) {
-                const u64 value = words[i];
-                if (value <= base || value >= end) {
-                    continue;
-                }
-                const u64 offset = value - base;
+            // Inclusive counts: each frame of the unwound stack once (recursion counted once).
+            (void)read;
+            for (size_t i = 0; i < unwound_count; ++i) {
                 bool duplicate = false;
-                for (size_t j = 0; j < frames; ++j) {
-                    duplicate |= seen[j] == offset;
+                for (size_t j = 0; j < i; ++j) {
+                    duplicate |= unwound[j] == unwound[i];
                 }
                 if (!duplicate) {
-                    seen[frames++] = offset;
-                    ++profile.stack[offset];
+                    ++profile.stack[unwound[i]];
+                }
+                if (i + 1 < unwound_count) {
+                    ++profile.edges[(unwound[i] << 32) | unwound[i + 1]];
                 }
             }
         }
@@ -607,7 +690,7 @@ void Run() {
             if (profile.samples < 100) {
                 continue;
             }
-            const auto top = [&](const std::unordered_map<u64, u32>& counts) {
+            const auto top = [&](const std::unordered_map<u64, u32>& counts, size_t limit = 150) {
                 std::vector<std::pair<u32, u64>> sorted;
                 sorted.reserve(counts.size());
                 for (const auto& [offset, count] : counts) {
@@ -615,7 +698,7 @@ void Run() {
                 }
                 std::sort(sorted.rbegin(), sorted.rend());
                 std::string out;
-                for (size_t i = 0; i < sorted.size() && i < 25; ++i) {
+                for (size_t i = 0; i < sorted.size() && i < limit; ++i) {
                     out += fmt::format(" {:#x}:{:.1f}", sorted[i].second,
                                        100.0 * sorted[i].first / profile.samples);
                 }
@@ -625,6 +708,8 @@ void Run() {
                      top(profile.leaf));
             LOG_INFO(Common, "Sample profile {} ({} samples) stack:{}", name, profile.samples,
                      top(profile.stack));
+            LOG_INFO(Common, "Sample profile {} ({} samples) edges:{}", name, profile.samples,
+                     top(profile.edges, 400));
         }
         profiles.clear();
     }

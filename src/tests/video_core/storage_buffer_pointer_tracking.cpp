@@ -267,7 +267,7 @@ TEST_CASE("Native atomics carried into an unmapped pointer's high word become st
     CHECK(count(IR::Opcode::WriteGlobal32) == 0);
 }
 
-TEST_CASE("Native atomics with a carry that skips the pointer stay global",
+TEST_CASE("Native atomics with an unusual carry into an unmapped pointer use its buffer",
           "[shader][storage_buffer][global_atomic]") {
     KernelProgram fixture;
     fixture.env.native = true;
@@ -278,12 +278,13 @@ TEST_CASE("Native atomics with a carry that skips the pointer stay global",
     const IR::U32 carried{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))};
     const IR::U32 high{ir.IAdd(Word(ir, 0x1d4), carried)};
     static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, high), ir.Imm32(1)));
-    CHECK(fixture.TrackedOffsets().empty());
-    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x1d0});
 }
 
-TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
+TEST_CASE("Loaded global pointers get an indirect descriptor of their own",
           "[shader][storage_buffer]") {
+    // The pointer is read from the buffer at c0[0x110]: the access binds the buffer that pointer
+    // names (a table entry), not the table itself.
     const bool native = GENERATE(false, true);
     for (const bool add_offset : {false, true}) {
         KernelProgram fixture;
@@ -296,17 +297,23 @@ TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
         ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
                          ir.Imm32(1));
 
-        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110});
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110, 0x110});
         const auto has = [&](IR::Opcode opcode) {
             return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
                 return inst.GetOpcode() == opcode;
             });
         };
         CHECK(has(IR::Opcode::LoadStorage64));
-        CHECK(has(IR::Opcode::WriteGlobal32));
-        CHECK_FALSE(has(IR::Opcode::WriteStorage32));
-        REQUIRE(fixture.program.info.storage_buffers_descriptors.size() == 1);
-        CHECK_FALSE(fixture.program.info.storage_buffers_descriptors.front().is_written);
+        CHECK(has(IR::Opcode::WriteStorage32));
+        CHECK_FALSE(has(IR::Opcode::WriteGlobal32));
+        const auto& descriptors{fixture.program.info.storage_buffers_descriptors};
+        REQUIRE(descriptors.size() == 2);
+        // Sorted by indirect offset: the table entry at +0 first, then the table itself.
+        CHECK(descriptors[0].IsIndirect());
+        CHECK(descriptors[0].indirect_offset == 0);
+        CHECK(descriptors[0].is_written);
+        CHECK_FALSE(descriptors[1].IsIndirect());
+        CHECK_FALSE(descriptors[1].is_written);
     }
 }
 
