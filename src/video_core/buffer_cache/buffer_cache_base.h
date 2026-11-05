@@ -544,6 +544,12 @@ private:
 
     void ClearDownload(DAddr base_addr, u64 size);
 
+    /// A guest CPU write to [device_addr, device_addr + size) on pages that also hold
+    /// GPU-written bytes: copies the CPU's bytes into the buffers holding them, leaving the
+    /// GPU's bytes on those pages in place, instead of downloading the pages (a wait for the
+    /// host GPU) and uploading them whole. False when it is turned off (EDEN_NX2_CPU_WRITE_UPLOAD=0).
+    bool UploadCpuWrite(DAddr device_addr, u64 size);
+
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 

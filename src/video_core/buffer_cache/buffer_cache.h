@@ -191,10 +191,53 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
     if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+        // Ocarina of Time writes next to GPU-written data ~4,400 times a second: downloading
+        // the pages waited for the host GPU each time (~350 ms a second of the GPU thread).
+        // The CPU's bytes go to the GPU's copy instead and the pages stay GPU-modified.
+        if (UploadCpuWrite(device_addr, size)) {
+            MarkVertexBuffersStale(device_addr, size);
+            return;
+        }
         DownloadMemory(page_begin, page_end - page_begin);
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
+}
+
+template <class P>
+bool BufferCache<P>::UploadCpuWrite(DAddr device_addr, u64 size) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_CPU_WRITE_UPLOAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || size == 0 || size > 64_MiB) {
+        return false;
+    }
+    const DAddr write_end = device_addr + size;
+    ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+        const DAddr start = (std::max)(buffer.CpuAddr(), device_addr);
+        const DAddr end = (std::min)(buffer.CpuAddr() + buffer.SizeBytes(), write_end);
+        if (start >= end) {
+            return;
+        }
+        const u64 length = end - start;
+        if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+            auto upload_staging = runtime.UploadStagingBuffer(length);
+            std::array copies{BufferCopy{
+                .src_offset = upload_staging.offset,
+                .dst_offset = buffer.Offset(start),
+                .size = length,
+            }};
+            device_memory.ReadBlockUnsafe(start, upload_staging.mapped_span.data(), length);
+            const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+            runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+        } else {
+            tmp_buffer.resize_destructive(length);
+            device_memory.ReadBlockUnsafe(start, tmp_buffer.data(), length);
+            buffer.ImmediateUpload(buffer.Offset(start), std::span<const u8>{tmp_buffer.data(), length});
+        }
+    });
+    return true;
 }
 
 template <class P>
