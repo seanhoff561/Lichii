@@ -118,7 +118,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x202: case 0x802: case 0x424: case 0x724: case 0x824: case 0xe24: case 0x227:
         case 0x810: case 0x819: case 0x845: case 0x906: case 0x820:
         case 0x812: case 0x589:
-        case 0x212: case 0x207: case 0x807: case 0x208: case 0x808:
+        case 0x212: case 0x207: case 0x807: case 0xc07: case 0x208: case 0x808: case 0xc08:
         case 0x220: case 0xa20: case 0x221: case 0x421: case 0x621:
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23:
         case 0x243: case 0x245: case 0x306:
@@ -3217,8 +3217,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(78, 2)} << 39));
             break;
         }
-        case 0x207: case 0x807: case 0xa07:
-        case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
+        case 0x207: case 0x807: case 0xa07: case 0xc07:
+        case 0x208: case 0x808: case 0xa08: case 0xc08: { // Bitwise SEL / FSEL (0xc0x: uniform b)
             // FSEL applies the floating operand modifiers (negate/absolute) before selecting.
             const bool floating = (opcode & 0x1ff) == 0x008;
             const u32 a = operand(0, floating), b = operand(1, floating);
@@ -3408,7 +3408,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const bool extended = insn.Bits(74, 1) != 0;
                 const u32 high = insn.Bits(64, 8);
                 if (insn.Bits(72, 1) || insn.Bits(81, 3) != 7 ||
-                    (high != 255 && insn.Bits(73, 1)) || ((opcode == 0x211 || opcode == 0xa11) && insn.Bits(62, 2)) ||
+                    (high != 255 && insn.Bits(73, 1)) || ((opcode == 0x211 || opcode == 0xa11) && insn.Bits(62, 1)) ||
+                    (opcode == 0xa11 && insn.Bits(63, 1)) ||
                     (opcode == 0xc11 && (insn.words[1] & ~0x3fU)))
                     return fail(index, "native high effective address mode");
                 u32 b = opcode == 0xc11 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
@@ -3425,7 +3426,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     else emit(target | 0x36f8000000000000ULL | (u64{insn.Bits(24, 8)} << 8) | (u64{high} << 39) |
                               (u64{insn.Bits(75, 5)} << 20));
                 };
-                if (b == 255 && !extended) {
+                if (b == 255 && !extended) { // -RZ is RZ too
                     high_word(base(0));
                 } else {
                     high_word(predicate | 250);
@@ -3435,7 +3436,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                              (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
                         emit(0x5c10000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{252} << 20));
                     }
-                    emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{b} << 20));
+                    // 0x211 bit 63 negates Rb (Ocarina of Time: LEA.HI Rd, Ra, -Rb, RZ, 0x1f).
+                    emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{b} << 20) |
+                         (u64{opcode == 0x211 ? insn.Bits(63, 1) : 0U} << 48));
                 }
                 break;
             }
