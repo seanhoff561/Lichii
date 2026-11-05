@@ -5,7 +5,14 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include <limits>
 #include <string>
 #include <thread>
@@ -23,6 +30,10 @@
 #include <windows.h>
 #include "common/string_util.h"
 #include "common/windows/timer_resolution.h"
+#if defined(_M_X64) || defined(__x86_64__)
+#define NX2_SAMPLER 1
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+#endif
 #else
 #if defined(__FreeBSD__)
 #include <sys/cpuset.h>
@@ -503,7 +514,146 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+#ifdef NX2_SAMPLER
+// EDEN_NX2_SAMPLE_PROFILE=1 (also from nx2_switches.txt): a sampling profiler for the named
+// threads. About every millisecond each one is suspended for its instruction pointer and the
+// return addresses near its stack pointer; every 10 s the hottest addresses per thread are logged
+// as executable offsets ("ext" outside it), symbolized offline against the PDB. While a thread is
+// suspended the sampler only makes system calls (no heap, no locks), so it cannot deadlock on a
+// lock the thread holds.
+namespace Nx2Sampler {
+namespace {
+struct SampledThread {
+    HANDLE handle;
+    std::string name;
+};
+std::mutex g_threads_mutex;
+std::vector<SampledThread> g_threads;
+std::once_flag g_started;
+
+constexpr size_t StackWords = 96;
+constexpr size_t CallerFrames = 8;
+
+bool Enabled() {
+    const char* value = std::getenv("EDEN_NX2_SAMPLE_PROFILE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+void Run() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    const u64 base = reinterpret_cast<u64>(&__ImageBase);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const u8*>(&__ImageBase) + __ImageBase.e_lfanew);
+    const u64 end = base + nt->OptionalHeader.SizeOfImage;
+    struct Profile {
+        u64 samples{};
+        std::unordered_map<u64, u32> leaf;
+        std::unordered_map<u64, u32> stack;
+    };
+    std::map<std::string, Profile> profiles;
+    std::vector<SampledThread> threads;
+    auto last_report = std::chrono::steady_clock::now();
+    u64 words[StackWords];
+    for (;;) {
+        Sleep(1);
+        {
+            std::scoped_lock lock{g_threads_mutex};
+            threads = g_threads;
+        }
+        for (const SampledThread& thread : threads) {
+            if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) {
+                continue;
+            }
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            const bool got = GetThreadContext(thread.handle, &context) != 0;
+            SIZE_T read = 0;
+            if (got) {
+                ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(context.Rsp), words,
+                                  sizeof(words), &read);
+            }
+            ResumeThread(thread.handle);
+            if (!got) {
+                continue;
+            }
+            Profile& profile = profiles[thread.name];
+            ++profile.samples;
+            const u64 rip = context.Rip;
+            ++profile.leaf[rip >= base && rip < end ? rip - base : 1];
+            u64 seen[CallerFrames]{};
+            size_t frames = 0;
+            for (size_t i = 0; i < read / sizeof(u64) && frames < CallerFrames; ++i) {
+                const u64 value = words[i];
+                if (value <= base || value >= end) {
+                    continue;
+                }
+                const u64 offset = value - base;
+                bool duplicate = false;
+                for (size_t j = 0; j < frames; ++j) {
+                    duplicate |= seen[j] == offset;
+                }
+                if (!duplicate) {
+                    seen[frames++] = offset;
+                    ++profile.stack[offset];
+                }
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report < std::chrono::seconds{10}) {
+            continue;
+        }
+        last_report = now;
+        for (auto& [name, profile] : profiles) {
+            if (profile.samples < 100) {
+                continue;
+            }
+            const auto top = [&](const std::unordered_map<u64, u32>& counts) {
+                std::vector<std::pair<u32, u64>> sorted;
+                sorted.reserve(counts.size());
+                for (const auto& [offset, count] : counts) {
+                    sorted.emplace_back(count, offset);
+                }
+                std::sort(sorted.rbegin(), sorted.rend());
+                std::string out;
+                for (size_t i = 0; i < sorted.size() && i < 25; ++i) {
+                    out += fmt::format(" {:#x}:{:.1f}", sorted[i].second,
+                                       100.0 * sorted[i].first / profile.samples);
+                }
+                return out;
+            };
+            LOG_INFO(Common, "Sample profile {} ({} samples) leaf:{}", name, profile.samples,
+                     top(profile.leaf));
+            LOG_INFO(Common, "Sample profile {} ({} samples) stack:{}", name, profile.samples,
+                     top(profile.stack));
+        }
+        profiles.clear();
+    }
+}
+} // Anonymous namespace
+
+void Register(const char* name) {
+    if (!Enabled()) {
+        return;
+    }
+    HANDLE handle{};
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                         FALSE, 0)) {
+        return;
+    }
+    {
+        std::scoped_lock lock{g_threads_mutex};
+        g_threads.push_back({handle, name});
+    }
+    std::call_once(g_started, [] { std::thread{Run}.detach(); });
+}
+} // namespace Nx2Sampler
+#endif
+
 void SetCurrentThreadName(const char* name) {
+#ifdef NX2_SAMPLER
+    Nx2Sampler::Register(name);
+#endif
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
