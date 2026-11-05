@@ -58,6 +58,44 @@ void CountRenderPassEnd(const char* file, u32 line) {
     ++g_profile_ends[fmt::format("{}:{}", name, line)];
 }
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long frames_to_skip, unsigned long frames_to_capture, void** back_trace,
+    unsigned long* back_trace_hash);
+extern "C" const char __ImageBase;
+#endif
+
+constexpr size_t BlockingStackDepth = 12;
+struct BlockingSite {
+    u64 count{};
+    u64 ns{};
+};
+std::mutex g_blocking_mutex;
+std::map<std::array<u64, BlockingStackDepth>, BlockingSite> g_blocking_sites;
+
+void ReportBlockingSites(double seconds) {
+    std::vector<std::pair<std::array<u64, BlockingStackDepth>, BlockingSite>> sites;
+    {
+        std::scoped_lock lock{g_blocking_mutex};
+        sites.assign(g_blocking_sites.begin(), g_blocking_sites.end());
+        g_blocking_sites.clear();
+    }
+    std::sort(sites.begin(), sites.end(),
+              [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    for (size_t i = 0; i < sites.size() && i < 12; ++i) {
+        std::string stack;
+        for (const u64 frame : sites[i].first) {
+            if (frame == 0) {
+                break;
+            }
+            stack += fmt::format(" {:#x}", frame);
+        }
+        LOG_INFO(Render_Vulkan, "GPU wait {:.0f}/s {:.1f} ms/s at{}",
+                 static_cast<double>(sites[i].second.count) / seconds,
+                 static_cast<double>(sites[i].second.ns) / 1e6 / seconds, stack);
+    }
+}
+
 void ReportSubmitCounts() {
     const u64 now = VideoCommon::Nx2Profile::Now();
     u64 start = g_profile_window_start.load(std::memory_order_relaxed);
@@ -77,6 +115,7 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+    ReportBlockingSites(seconds);
     std::vector<std::pair<u64, std::string>> ends;
     {
         std::scoped_lock lock{g_profile_end_mutex};
@@ -91,6 +130,28 @@ void ReportSubmitCounts() {
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
     }
 }
+}
+
+bool ProfileBlockingWaits() {
+    return VideoCommon::Nx2Profile::Enabled();
+}
+
+void NoteBlockingWait(u64 ns) {
+    std::array<u64, BlockingStackDepth> key{};
+#ifdef _WIN32
+    void* frames[BlockingStackDepth]{};
+    const unsigned short captured =
+        RtlCaptureStackBackTrace(1, static_cast<unsigned long>(BlockingStackDepth), frames, nullptr);
+    const u64 base = reinterpret_cast<u64>(&__ImageBase);
+    for (unsigned short i = 0; i < captured; ++i) {
+        const u64 address = reinterpret_cast<u64>(frames[i]);
+        key[i] = address >= base ? address - base : address;
+    }
+#endif
+    std::scoped_lock lock{g_blocking_mutex};
+    BlockingSite& site = g_blocking_sites[key];
+    ++site.count;
+    site.ns += ns;
 }
 
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,

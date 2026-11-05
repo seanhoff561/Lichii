@@ -35,6 +35,12 @@ class QueryCacheBase;
 
 namespace Vulkan {
 
+/// EDEN_NX2_GPU_PROFILE: whether waits for the host GPU are attributed to their callers.
+bool ProfileBlockingWaits();
+/// Counts a wait for the host GPU of ns nanoseconds against the calling stack (reported every
+/// 10 s with the scheduler's submit counts, as offsets into the executable).
+void NoteBlockingWait(u64 ns);
+
 class CommandPool;
 class Device;
 class Framebuffer;
@@ -219,7 +225,16 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
-            master_semaphore->Wait(tick);
+            if (ProfileBlockingWaits() && !master_semaphore->IsFree(tick)) [[unlikely]] {
+                const auto wait_start = std::chrono::steady_clock::now();
+                master_semaphore->Wait(tick);
+                NoteBlockingWait(static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wait_start)
+                        .count()));
+            } else {
+                master_semaphore->Wait(tick);
+            }
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
