@@ -165,15 +165,15 @@ TEST_CASE("Native pointer classification rejects a scalar selected by word track
     CHECK(fixture.program.info.storage_buffers_descriptors.front().is_written);
 }
 
-TEST_CASE("Native accesses without mapped pointers are not rebased on scalars",
+TEST_CASE("Native accesses through a pointer unmapped at build time keep its buffer",
           "[shader][storage_buffer]") {
+    // The binding reads the pointer again for every draw; a global access reads zero forever.
     KernelProgram fixture;
     fixture.env.native = true;
     fixture.env.scalar_offsets = {0x310};
     IR::IREmitter ir{fixture.entry};
     ir.WriteGlobal32(Address(ir, Word(ir, 0x310), Word(ir, 0x314)), ir.Imm32(1));
-    CHECK(fixture.TrackedOffsets().empty());
-    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::WriteGlobal32);
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x310});
 }
 
 TEST_CASE("Native append counters behind unmapped pointers become storage atomics",
@@ -211,7 +211,7 @@ TEST_CASE("Native append counters behind unmapped pointers become storage atomic
     }
 }
 
-TEST_CASE("Native atomics offset from an unmapped pointer stay global",
+TEST_CASE("Native atomics offset from an unmapped pointer use its buffer",
           "[shader][storage_buffer][global_atomic]") {
     KernelProgram fixture;
     fixture.env.native = true;
@@ -219,8 +219,7 @@ TEST_CASE("Native atomics offset from an unmapped pointer stay global",
     IR::IREmitter ir{fixture.entry};
     const IR::U32 low{ir.IAdd(Word(ir, 0x1d0), Word(ir, 0x40))};
     static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, Word(ir, 0x1d4)), ir.Imm32(1)));
-    CHECK(fixture.TrackedOffsets().empty());
-    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x1d0});
 }
 
 TEST_CASE("Native atomics carried into an unmapped pointer's high word become storage atomics",

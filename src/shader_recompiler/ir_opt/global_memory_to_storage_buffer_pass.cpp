@@ -80,6 +80,10 @@ struct StorageInfo {
     std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
+    /// Blocks of the 64-bit word extracts, and the entry block, for pointers loaded from memory
+    std::unordered_map<const IR::Inst*, IR::Block*> extract_blocks;
+    IR::Block* entry{};
+    std::map<std::pair<const IR::Block*, const IR::Block*>, bool> dominance;
 };
 
 /// Returns true when the instruction is a global memory instruction
@@ -1069,8 +1073,58 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
 /// buffer pointer plus an immediate. The binding reads the table pointer from the constant buffer
 /// and the buffer pointer from the table, so the access becomes a storage buffer access. Without
 /// this the access stays global and reads zero when no bound buffer contains it.
+/// True when every path from the entry to block passes through dominator
+bool Dominates(StorageInfo& info, const IR::Block* dominator, const IR::Block* block) {
+    if (dominator == block) {
+        return true;
+    }
+    const auto key{std::make_pair(dominator, block)};
+    if (const auto it = info.dominance.find(key); it != info.dominance.end()) {
+        return it->second;
+    }
+    std::unordered_set<const IR::Block*> visited{dominator};
+    std::vector<const IR::Block*> pending;
+    if (info.entry && visited.insert(info.entry).second) {
+        pending.push_back(info.entry);
+    }
+    bool reached{};
+    while (!pending.empty() && !reached) {
+        const IR::Block* const current{pending.back()};
+        pending.pop_back();
+        reached = current == block;
+        for (const IR::Block* const next : current->ImmSuccessors()) {
+            if (visited.insert(next).second) {
+                pending.push_back(next);
+            }
+        }
+    }
+    const bool result{info.entry != nullptr && !reached};
+    info.dominance.emplace(key, result);
+    return result;
+}
+
+/// True when value is defined where it can be used by inst in block
+bool Available(StorageInfo& info, IR::Inst* value, IR::Block& block, IR::Inst& inst) {
+    const auto it{info.extract_blocks.find(value)};
+    if (it == info.extract_blocks.end()) {
+        return false;
+    }
+    if (it->second != &block) {
+        return Dominates(info, it->second, &block);
+    }
+    for (IR::Inst& other : block.Instructions()) {
+        if (&other == value) {
+            return true;
+        }
+        if (&other == &inst) {
+            return false;
+        }
+    }
+    return false;
+}
+
 std::optional<std::pair<StorageBufferAddr, IR::Inst*>> TrackIndirectPointer(
-    const LowAddrInfo& addr) {
+    const LowAddrInfo& addr, StorageInfo& info, IR::Block& block, IR::Inst& access) {
     IR::Inst* pointer_low{};
     bool ambiguous{};
     const auto is_load_word = [](const IR::Inst* inst, u32 element) -> IR::Inst* {
@@ -1082,41 +1136,70 @@ std::optional<std::pair<StorageBufferAddr, IR::Inst*>> TrackIndirectPointer(
         IR::Inst* const load{inst->Arg(0).InstRecursive()};
         return load->GetOpcode() == IR::Opcode::LoadGlobal64 ? load : nullptr;
     };
-    const auto visit_low{[&](const auto& self, const IR::Value& term) -> void {
-        if (term.IsImmediate() || ambiguous) {
-            return;
+    // Walk the additions, selects and phis (a pointer stepped through a loop) the address is
+    // built from. All loaded pointers in it have to be the same load.
+    const auto collect{[&](const IR::Value& root, u32 element) {
+        small_vector<IR::Inst*, 4> words;
+        small_vector<IR::Inst*, 32> pending;
+        std::unordered_set<const IR::Inst*> visited;
+        if (!root.IsImmediate()) {
+            pending.push_back(root.InstRecursive());
         }
-        IR::Inst* const inst{term.InstRecursive()};
-        if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0));
-            self(self, inst->Arg(1));
-            return;
+        while (!pending.empty() && visited.size() < 4096) {
+            IR::Inst* const inst{pending.back()};
+            pending.pop_back();
+            if (!visited.insert(inst).second) {
+                continue;
+            }
+            const auto enqueue = [&](const IR::Value& value) {
+                if (!value.IsImmediate()) {
+                    pending.push_back(value.InstRecursive());
+                }
+            };
+            switch (inst->GetOpcode()) {
+            case IR::Opcode::IAdd32:
+                enqueue(inst->Arg(0));
+                enqueue(inst->Arg(1));
+                break;
+            case IR::Opcode::Phi:
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    enqueue(inst->Arg(arg));
+                }
+                break;
+            case IR::Opcode::SelectU32:
+                enqueue(inst->Arg(1));
+                enqueue(inst->Arg(2));
+                break;
+            default:
+                if (is_load_word(inst, element) || is_load_word(inst, element ^ 1)) {
+                    words.push_back(inst);
+                }
+                break;
+            }
         }
-        if (is_load_word(inst, 0)) {
-            ambiguous = pointer_low != nullptr && pointer_low != inst;
-            pointer_low = inst;
-        }
+        return words;
     }};
-    visit_low(visit_low, addr.value);
-    if (ambiguous || !pointer_low) {
+    const auto low_words{collect(addr.value, 0)};
+    IR::Inst* load{};
+    for (IR::Inst* const word : low_words) {
+        IR::Inst* const word_load{word->Arg(0).InstRecursive()};
+        ambiguous |= word->Arg(1).U32() != 0 || (load != nullptr && load != word_load);
+        load = word_load;
+        if (!pointer_low && Available(info, word, block, access)) {
+            pointer_low = word;
+        }
+    }
+    if (ambiguous || !load || !pointer_low) {
         return std::nullopt;
     }
-    IR::Inst* const load{pointer_low->Arg(0).InstRecursive()};
     // The high half has to come from the same pointer
     bool high_matches{};
-    const auto visit_high{[&](const auto& self, const IR::Value& term, u32 depth) -> void {
-        if (term.IsImmediate() || high_matches || depth > 4) {
-            return;
+    for (IR::Inst* const word : collect(addr.high, 1)) {
+        if (word->Arg(0).InstRecursive() != load || word->Arg(1).U32() != 1) {
+            return std::nullopt;
         }
-        const IR::Inst* const inst{term.InstRecursive()};
-        if (inst->GetOpcode() == IR::Opcode::IAdd32) {
-            self(self, inst->Arg(0), depth + 1);
-            self(self, inst->Arg(1), depth + 1);
-            return;
-        }
-        high_matches = is_load_word(inst, 1) == load;
-    }};
-    visit_high(visit_high, addr.high, 0);
+        high_matches = true;
+    }
     if (!high_matches) {
         return std::nullopt;
     }
@@ -1208,7 +1291,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
     }
     if (!storage_buffer) {
-        if (const auto indirect{TrackIndirectPointer(*low_addr_info)}) {
+        if (const auto indirect{TrackIndirectPointer(*low_addr_info, info, block, inst)}) {
             if (IsGlobalMemoryWrite(inst)) {
                 info.writes.insert(indirect->first);
             }
@@ -1223,11 +1306,12 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         }
     }
     if (native && !storage_buffer) {
-        // A pointer that is an atomic's address keeps its buffer while unmapped, for the atomic
-        // and every access based on it: Bananza's append counters and the records stored after
-        // them were unmapped when their pipelines were first built. The binding reads the pointer
-        // again for every dispatch.
-        if (!paired_pointer || !info.atomic_pointers.contains(*paired_pointer)) {
+        // The one 64-bit constant buffer pointer the address is built from keeps its buffer while
+        // unmapped: the pipeline is built once, often before the game fills the pointer in
+        // (Bananza's append counters, Ocarina of Time's vertex instance data), and a global access
+        // with no buffer reads zero forever. The binding reads the pointer again for every draw
+        // and dispatch, and a pointer that is still unmapped binds nothing.
+        if (!paired_pointer) {
             return;
         }
         storage_buffer = paired_pointer;
@@ -1402,6 +1486,14 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
     TrackingConditions conditions{program};
     StorageInfo info;
+    info.entry = program.post_order_blocks.empty() ? nullptr : program.post_order_blocks.back();
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::CompositeExtractU32x2) {
+                info.extract_blocks.emplace(&inst, block);
+            }
+        }
+    }
     info.iterator_words = CollectIteratorWords(program);
     info.atomic_pointers = CollectAtomicPointers(program);
     for (IR::Block* const block : program.post_order_blocks) {
