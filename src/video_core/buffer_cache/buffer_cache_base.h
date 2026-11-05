@@ -598,6 +598,38 @@ private:
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
     /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// A GPU write to [device_addr, device_addr + size): its Preflushable pages are downloaded at
+    /// the next fence and the rest get read traps. Only the pages the guest CPU has read: a large
+    /// storage buffer with one such page otherwise went back whole at every fence (Ocarina of
+    /// Time: 2.4 MB copies, ~6 GB/s over PCIe, 10-25 fps).
+    void QueueGpuWriteDownloads(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            return;
+        }
+        if (!memory_tracker.IsRegionPreflushable(device_addr, size)) {
+            ArmReadTraps(device_addr, size);
+            return;
+        }
+        const DAddr end = device_addr + size;
+        DAddr cursor = device_addr;
+        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr start, u64 length) {
+            const DAddr lower = (std::max)(start, cursor);
+            const DAddr upper = (std::min)(start + length, end);
+            if (lower >= upper) {
+                return;
+            }
+            if (cursor < lower) {
+                ArmReadTraps(cursor, lower - cursor);
+            }
+            uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+            cursor = upper;
+        });
+        if (cursor < end) {
+            ArmReadTraps(cursor, end - cursor);
+        }
+    }
+
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
