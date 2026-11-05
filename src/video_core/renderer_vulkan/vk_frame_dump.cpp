@@ -252,6 +252,8 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
     }
     pass_hashes.clear();
     pass_programs.clear();
+    pass_constants.clear();
+    pass_constants_set = false;
     pass_first_draw = draws;
     return recorded;
 }
@@ -268,6 +270,11 @@ void FrameDump::NoteDraw(std::span<const u64> shader_hashes, u64 pixel_program) 
             pass_hashes.push_back(hash);
         }
     }
+}
+
+void FrameDump::NoteConstants(std::string json) {
+    pass_constants = std::move(json);
+    pass_constants_set = true;
 }
 
 bool FrameDump::EndPass() {
@@ -289,9 +296,9 @@ bool FrameDump::EndPass() {
             target,
             fmt::format("{:04}_pass{:03}_d{}-{}_rt{}", sequence++, pass_index, pass_first_draw,
                         draws, target.slot),
-            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}],"ps_programs":[{}])",
+            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}],"ps_programs":[{}],"ps_cbufs":{{{}}})",
                         pass_index, pass_first_draw, draws - pass_first_draw, target.slot,
-                        shaders, programs));
+                        shaders, programs, pass_constants));
     }
     ++pass_index;
     return recorded;

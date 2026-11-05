@@ -440,6 +440,27 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         frame_dump.NoteDraw(pipeline->ShaderHashes(),
                             (u64{dump_regs.pipelines[5].reserved[0] & 0xff} << 32) |
                                 dump_regs.pipelines[5].reserved[1]);
+        if (frame_dump.WantsConstants()) {
+            // Raw words of the pixel stage's bound constant buffers, as the guest last wrote them.
+            std::string cbufs;
+            const auto& fragment = maxwell3d->state.shader_stages[4];
+            for (size_t index = 0; index < fragment.const_buffers.size(); ++index) {
+                const auto& cbuf = fragment.const_buffers[index];
+                if (!cbuf.enabled || cbuf.address == 0 || cbuf.size == 0) {
+                    continue;
+                }
+                std::array<u32, 128> words{};
+                const size_t bytes = std::min<size_t>(cbuf.size & ~3U, sizeof(words));
+                if (bytes == 0 || !gpu_memory->IsFullyMappedRange(cbuf.address, bytes)) {
+                    continue;
+                }
+                gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(), bytes);
+                cbufs += fmt::format(R"({}"c{}":{{"addr":"{:x}","size":{},"w":["{:x}"]}})",
+                                     cbufs.empty() ? "" : ",", index, cbuf.address, cbuf.size,
+                                     fmt::join(std::span{words.data(), bytes / 4}, "\",\""));
+            }
+            frame_dump.NoteConstants(std::move(cbufs));
+        }
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
         LOG_DEBUG(Render_Vulkan,

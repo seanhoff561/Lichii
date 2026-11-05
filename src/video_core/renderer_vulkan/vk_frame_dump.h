@@ -38,6 +38,12 @@ public:
     /// pixel_program: the draw's native pixel shader address (0 when none), matched to
     /// EDEN_NX2_SHADER_DUMP's file names.
     void NoteDraw(std::span<const u64> shader_hashes, u64 pixel_program = 0);
+    /// True until the current pass has its first draw's pixel-stage constant buffers.
+    [[nodiscard]] bool WantsConstants() const noexcept {
+        return capturing && !pass_constants_set;
+    }
+    /// The first draw's pixel-stage constant buffers, as JSON members ("c3":{...}).
+    void NoteConstants(std::string json);
     /// Captures the current pass; returns true when copies were recorded.
     bool EndPass();
     void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written);
@@ -98,6 +104,8 @@ private:
     std::vector<Target> pass_targets;
     std::vector<u64> pass_hashes;
     std::vector<u64> pass_programs;
+    std::string pass_constants;
+    bool pass_constants_set{};
     u32 pass_index{};
     u32 pass_first_draw{};
     u32 draws{};
