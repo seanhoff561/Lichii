@@ -35,7 +35,9 @@ public:
     /// Starts a pass when the framebuffer changes and captures the previous one.
     /// Returns true when copies were recorded, which ends the current render pass.
     bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors);
-    void NoteDraw(std::span<const u64> shader_hashes);
+    /// pixel_program: the draw's native pixel shader address (0 when none), matched to
+    /// EDEN_NX2_SHADER_DUMP's file names.
+    void NoteDraw(std::span<const u64> shader_hashes, u64 pixel_program = 0);
     /// Captures the current pass; returns true when copies were recorded.
     bool EndPass();
     void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written);
@@ -95,6 +97,7 @@ private:
     const void* pass_framebuffer{};
     std::vector<Target> pass_targets;
     std::vector<u64> pass_hashes;
+    std::vector<u64> pass_programs;
     u32 pass_index{};
     u32 pass_first_draw{};
     u32 draws{};

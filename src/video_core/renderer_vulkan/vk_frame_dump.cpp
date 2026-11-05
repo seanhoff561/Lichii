@@ -251,12 +251,17 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
         }
     }
     pass_hashes.clear();
+    pass_programs.clear();
     pass_first_draw = draws;
     return recorded;
 }
 
-void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
+void FrameDump::NoteDraw(std::span<const u64> shader_hashes, u64 pixel_program) {
     ++draws;
+    if (pixel_program != 0 && pass_programs.size() < 32 &&
+        std::ranges::find(pass_programs, pixel_program) == pass_programs.end()) {
+        pass_programs.push_back(pixel_program);
+    }
     for (const u64 hash : shader_hashes) {
         if (hash != 0 && pass_hashes.size() < 32 &&
             std::ranges::find(pass_hashes, hash) == pass_hashes.end()) {
@@ -274,15 +279,19 @@ bool FrameDump::EndPass() {
     for (const u64 hash : pass_hashes) {
         shaders += fmt::format("{}\"{:016x}\"", shaders.empty() ? "" : ",", hash);
     }
+    std::string programs;
+    for (const u64 program : pass_programs) {
+        programs += fmt::format("{}\"{:x}\"", programs.empty() ? "" : ",", program);
+    }
     bool recorded = false;
     for (const Target& target : pass_targets) {
         recorded |= Record(
             target,
             fmt::format("{:04}_pass{:03}_d{}-{}_rt{}", sequence++, pass_index, pass_first_draw,
                         draws, target.slot),
-            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}])",
+            fmt::format(R"("kind":"pass","pass":{},"first_draw":{},"draw_count":{},"slot":{},"shaders":[{}],"ps_programs":[{}])",
                         pass_index, pass_first_draw, draws - pass_first_draw, target.slot,
-                        shaders));
+                        shaders, programs));
     }
     ++pass_index;
     return recorded;

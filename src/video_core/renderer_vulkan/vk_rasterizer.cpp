@@ -436,7 +436,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
         FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(pipeline->ShaderHashes());
+        const auto& dump_regs = maxwell3d->regs;
+        frame_dump.NoteDraw(pipeline->ShaderHashes(),
+                            (u64{dump_regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                dump_regs.pipelines[5].reserved[1]);
     }
     if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
         LOG_DEBUG(Render_Vulkan,
