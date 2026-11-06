@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -48,6 +49,9 @@ public:
     }
 
     void Gather(std::function<void(PAddr, size_t)>& callback) {
+        // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
+        // gatherers so one cannot swap or clear front_buffer while another iterates it.
+        std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
@@ -72,6 +76,33 @@ public:
             }
         }
         front_buffer.clear();
+    }
+
+    /// Returns true when collected writes not yet gathered overlap [address, address + size).
+    bool Overlaps(PAddr address, size_t size) {
+        const PAddr end = address + size;
+        const auto overlaps = [&](TransformAddress t) {
+            if (!IsValid(t.address)) {
+                return false;
+            }
+            const PAddr begin = static_cast<PAddr>(t.address) << page_bits;
+            if (address >= begin + page_size || end <= begin) {
+                return false;
+            }
+            const size_t minor_bit = address > begin ? (address - begin) >> align_bits : 0;
+            const size_t top_bit = ((std::min)(end - begin, PAddr{page_size}) + align_mask) >> align_bits;
+            return (t.mask & CreateMask<u32>(top_bit, minor_bit)) != 0;
+        };
+        std::scoped_lock lk(guard);
+        if (overlaps(current.load(std::memory_order_acquire))) {
+            return true;
+        }
+        for (const TransformAddress& t : back_buffer) {
+            if (overlaps(t)) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:
@@ -115,6 +146,7 @@ private:
 
     std::atomic<TransformAddress> current{};
     std::mutex guard;
+    std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
 };

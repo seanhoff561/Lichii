@@ -71,6 +71,17 @@ public:
         return written_images;
     }
 
+    struct SampledImage {
+        u32 tic;
+        VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
+    };
+
+    /// The textures sampled by the last configured dispatch, kept while a sampled frame dump runs.
+    [[nodiscard]] std::span<const SampledImage> SampledImages() const noexcept {
+        return sampled_images;
+    }
+
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
@@ -86,6 +97,7 @@ private:
     u64 shader_hash{};
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
+    std::vector<SampledImage> sampled_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 

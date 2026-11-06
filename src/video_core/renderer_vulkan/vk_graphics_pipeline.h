@@ -9,9 +9,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <condition_variable>
+#include <chrono>
 #include <functional>
-#include <mutex>
+#include <optional>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -85,11 +87,26 @@ public:
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {});
+
+    static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
+    }
+
+    struct SampledImage {
+        u32 stage;
+        u32 tic;
+        VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
+    };
+
+    /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
+    std::span<const SampledImage> SampledImages() const noexcept {
+        return sampled_images;
     }
 
     bool SupportsAlphaToCoverage() const noexcept {
@@ -145,7 +162,11 @@ public:
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
-        return is_built.load(std::memory_order::relaxed);
+        return build->IsBuilt();
+    }
+
+    [[nodiscard]] bool Failed() const noexcept {
+        return build->Failed();
     }
 
     template <typename Spec>
@@ -159,9 +180,6 @@ public:
     }
 
 private:
-    /// Builds the pipeline once, on whichever thread gets here first.
-    void RunBuild();
-
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
@@ -196,6 +214,7 @@ private:
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
+    std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
     bool writes_storage{};
@@ -212,13 +231,10 @@ private:
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
 
-    std::function<void()> build_task;
-    std::atomic_bool build_claimed{false};
-    std::condition_variable build_condvar;
-    std::mutex build_mutex;
-    std::atomic_bool is_built{false};
+    const bool worker_only_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
+    std::optional<PipelineBuild> build;
 };
 
 } // namespace Vulkan

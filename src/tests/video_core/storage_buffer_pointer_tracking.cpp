@@ -297,23 +297,38 @@ TEST_CASE("Loaded global pointers get an indirect descriptor of their own",
         ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
                          ir.Imm32(1));
 
-        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110, 0x110});
+        const std::vector<u32> offsets{fixture.TrackedOffsets()};
         const auto has = [&](IR::Opcode opcode) {
             return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
                 return inst.GetOpcode() == opcode;
             });
         };
         CHECK(has(IR::Opcode::LoadStorage64));
+        const auto& descriptors{fixture.program.info.storage_buffers_descriptors};
+        if (!native) {
+            CHECK(has(IR::Opcode::WriteGlobal32));
+            CHECK_FALSE(has(IR::Opcode::WriteStorage32));
+            CHECK(offsets == std::vector<u32>{0x110});
+            REQUIRE(descriptors.size() == 1);
+            CHECK_FALSE(descriptors.front().is_written);
+            continue;
+        }
+        // One table and entry: a plain storage access on the entry's own descriptor. The table
+        // keeps its descriptor for the load of the pointer, and stays unwritten.
         CHECK(has(IR::Opcode::WriteStorage32));
         CHECK_FALSE(has(IR::Opcode::WriteGlobal32));
-        const auto& descriptors{fixture.program.info.storage_buffers_descriptors};
+        CHECK(offsets == std::vector<u32>{0x110, 0x110});
         REQUIRE(descriptors.size() == 2);
-        // Sorted by indirect offset: the table entry at +0 first, then the table itself.
-        CHECK(descriptors[0].IsIndirect());
-        CHECK(descriptors[0].indirect_offset == 0);
-        CHECK(descriptors[0].is_written);
-        CHECK_FALSE(descriptors[1].IsIndirect());
-        CHECK_FALSE(descriptors[1].is_written);
+        const auto source_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.indirect_offset == ~0U; })};
+        REQUIRE(source_descriptor != descriptors.end());
+        CHECK(source_descriptor->cbuf_index == 0);
+        CHECK(source_descriptor->cbuf_offset == 0x110);
+        CHECK_FALSE(source_descriptor->is_written);
+        CHECK(std::ranges::count_if(descriptors,
+                                    [](const auto& desc) { return desc.is_written; }) == 1);
+        const auto loaded_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.is_written; })};
     }
 }
 

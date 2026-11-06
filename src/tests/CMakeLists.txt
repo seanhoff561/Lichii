@@ -5,10 +5,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    common/addon_config.cpp
+    video_core/buffer_cache_ports.cpp
+    video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
+    video_core/frame_dump_schedule.cpp
     video_core/gpu_timestamp.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
+    core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -21,7 +26,9 @@ add_executable(tests
     video_core/texture_rect_descriptor.cpp
     audio_core/batch_decoder.cpp
     audio_core/hardware_audio_codec.cpp
+    core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
+    core/builtin_patches.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
     video_core/ampere_fast_fusion_logged.cpp
@@ -50,9 +57,15 @@ add_executable(tests
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
+    video_core/async_shader_emission.cpp
+    video_core/pipeline_build.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/command_writer.cpp
+    video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
+    video_core/pending_maps.cpp
+    video_core/maxwell_fast_method.cpp
     hid_core/sensor_info.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
@@ -81,6 +94,7 @@ add_executable(tests
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
@@ -104,6 +118,9 @@ add_executable(tests
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/memory_manager_runs.cpp
+    video_core/nx2_perf_draw_binds.cpp
+    video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
@@ -131,7 +148,7 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core audio_core input_common video_core)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
@@ -140,6 +157,11 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 add_test(NAME tests COMMAND tests)
+
+if (WIN32 AND ARCHITECTURE_x86_64)
+    add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
+    target_link_libraries(event_wait_probe PRIVATE common)
+endif()
 
 add_executable(update_checker_tests
     common/update_checker.cpp

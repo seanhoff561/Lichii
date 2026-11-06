@@ -765,7 +765,7 @@ void KeplerCompute::CheckDlssNetwork() {
                 probe->mismatched, probe->blocks, probe->worst, probe->invalid_samples);
 }
 
-// Tells the Graphics tab what draws the game's DLSS evaluation, when that changes.
+// Logs what draws the game's DLSS evaluation, when that changes.
 void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker) {
     using VideoCore::GameDlssReason;
     using VideoCore::GameDlssState;
@@ -799,7 +799,6 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
                  VideoCore::GameDlssReasonText(shown.reason));
     }
     dlss_chain.status = shown;
-    VideoCore::SetGameDlssStatus(shown);
 }
 
 // Ends this frame's DLSS evaluation at its output pass: either the network's own result stays,

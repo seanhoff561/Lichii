@@ -144,6 +144,14 @@ public:
         });
     }
 
+    /// Call 'func' for each range marked as Preflushable
+    template <typename Func>
+    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
+        });
+    }
+
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
     template <typename Func>
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {
@@ -152,19 +160,40 @@ public:
         });
     }
 
-    /// Call 'func' for each Preflushable range (the marks stay).
-    template <typename Func>
-    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
-            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
-        });
-    }
-
     template <typename Func>
     void ForEachDownloadRangeAndClear(VAddr query_cpu_range, u64 query_size, Func&& func) {
         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, true, manager->cpu_addr + offset, size, func);
         });
+    }
+
+    /// ForEachUploadRange without the clean words (word_manager.h) at either end of each manager's
+    /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
+    template <typename Func>
+    void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+            const u64 dirty =
+                manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
+            if (dirty == 0) {
+                return;
+            }
+            const u64 begin = (std::max<u64>)(offset, std::countr_zero(dirty) * BYTES_PER_WORD);
+            const u64 end =
+                (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
+            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
+                                          static_cast<s64>(end - begin), func);
+        });
+    }
+    /// Verify mode: true when the clean words of the managers over a range match a recount.
+    [[nodiscard]] bool CleanWordsHold(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        const size_t first = query_cpu_addr >> HIGHER_PAGE_BITS;
+        const size_t last = (query_cpu_addr + (std::max<u64>)(query_size, 1) - 1) >> HIGHER_PAGE_BITS;
+        for (size_t page_index = first; page_index <= last; ++page_index) {
+            if (top_tier[page_index] && !top_tier[page_index]->CleanWordsHold()) {
+                return false;
+            }
+        }
+        return true;
     }
 
 private:

@@ -298,9 +298,9 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
 
             REQUIRE(shader.program.info.handle_programs.size() == 1);
             CHECK(shader.Evaluate(sample) ==
-                  0x1234 + 7 + (nested ? 0x50 : 0) + (retained_slot ? 2 * 0x50 : 0));
+                  0x1234U + 7U + (nested ? 0x50U : 0U) + (retained_slot ? 2U * 0x50U : 0U));
             CHECK(shader.Evaluate(sample, 0x5678, 0x90) ==
-                  0x5678 + 7 + (nested ? 0x90 : 0) + (retained_slot ? 2 * 0x90 : 0));
+                  0x5678U + 7U + (nested ? 0x90U : 0U) + (retained_slot ? 2U * 0x90U : 0U));
         }
     }
 }
