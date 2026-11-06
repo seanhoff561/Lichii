@@ -531,6 +531,10 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                                bool is_written, bool native_pointer = false) const;
 
+    [[nodiscard]] Binding ResolveStorageBufferBinding(GPUVAddr gpu_addr, u64 next_qword,
+                                                      u32 cbuf_index, bool is_written,
+                                                      bool native_pointer) const;
+
     [[nodiscard]] GPUVAddr IndirectStorageBufferSlot(GPUVAddr cbuf_slot,
                                                      u32 indirect_offset) const;
 
@@ -691,6 +695,17 @@ private:
     };
     Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
     VirtualRangeCache virtual_ranges;
+    /// Resolved storage buffer bindings: a bind walks the page tables and the kind map, over up
+    /// to 8 MiB, and a frame binds the same few pointers thousands of times.
+    struct StorageBindingCacheEntry {
+        GPUVAddr gpu_addr{};
+        u64 next_qword{};
+        u64 generation{~u64{0}};
+        size_t as_id{};
+        u32 flags{};
+        Binding binding{};
+    };
+    mutable std::array<StorageBindingCacheEntry, 1024> storage_binding_cache{};
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;

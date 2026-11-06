@@ -626,8 +626,29 @@ void Run() {
         std::unordered_map<u64, u32> leaf;
         std::unordered_map<u64, u32> stack;
         std::unordered_map<u64, u32> edges; ///< (frame << 32) | its caller's frame
+        /// Samples outside the executable: (module << 32) | the first executable frame.
+        std::unordered_map<u64, u32> outside;
     };
     std::map<std::string, Profile> profiles;
+    std::vector<std::string> modules;
+    const auto module_index = [&modules](u64 address) -> u64 {
+        HMODULE owner{};
+        char path[MAX_PATH]{};
+        std::string name = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(address), &owner) &&
+            GetModuleFileNameA(owner, path, MAX_PATH) != 0) {
+            name = path;
+            name = name.substr(name.find_last_of('\\') + 1);
+        }
+        const auto it = std::find(modules.begin(), modules.end(), name);
+        if (it != modules.end()) {
+            return static_cast<u64>(it - modules.begin());
+        }
+        modules.push_back(name);
+        return modules.size() - 1;
+    };
     std::vector<SampledThread> threads;
     auto last_report = std::chrono::steady_clock::now();
     u64 words[StackWords];
@@ -666,6 +687,9 @@ void Run() {
             ++profile.samples;
             const u64 rip = context.Rip;
             ++profile.leaf[rip >= base && rip < end ? rip - base : 1];
+            if ((rip < base || rip >= end) && unwound_count != 0) {
+                ++profile.outside[(module_index(rip) << 32) | unwound[0]];
+            }
             // Inclusive counts: each frame of the unwound stack once (recursion counted once).
             (void)read;
             for (size_t i = 0; i < unwound_count; ++i) {
@@ -710,6 +734,15 @@ void Run() {
                      top(profile.stack));
             LOG_INFO(Common, "Sample profile {} ({} samples) edges:{}", name, profile.samples,
                      top(profile.edges, 400));
+            std::string outside;
+            for (const auto& [key, count] : profile.outside) {
+                if (100.0 * count / profile.samples >= 0.1) {
+                    outside += fmt::format(" {}@{:#x}:{:.1f}", modules[key >> 32],
+                                           key & 0xffffffff, 100.0 * count / profile.samples);
+                }
+            }
+            LOG_INFO(Common, "Sample profile {} ({} samples) outside:{}", name, profile.samples,
+                     outside);
         }
         profiles.clear();
     }

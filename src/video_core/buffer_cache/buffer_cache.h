@@ -2659,7 +2659,34 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     if (gpu_addr == 0) {
         return NULL_BINDING;
     }
+    // A native pointer's next word is another parameter, so it doesn't take part.
+    const u64 next_qword = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
+    const u64 generation = gpu_memory->MappingGeneration();
+    const size_t as_id = gpu_memory->GetID();
+    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U);
+    const u64 hash = (gpu_addr >> 6) ^ (gpu_addr >> 18) ^ next_qword ^ flags;
+    auto& cached = storage_binding_cache[hash % storage_binding_cache.size()];
+    if (cached.gpu_addr == gpu_addr && cached.next_qword == next_qword &&
+        cached.generation == generation && cached.as_id == as_id && cached.flags == flags) {
+        return cached.binding;
+    }
+    const Binding binding =
+        ResolveStorageBufferBinding(gpu_addr, next_qword, cbuf_index, is_written, native_pointer);
+    cached = StorageBindingCacheEntry{
+        .gpu_addr = gpu_addr,
+        .next_qword = next_qword,
+        .generation = generation,
+        .as_id = as_id,
+        .flags = flags,
+        .binding = binding,
+    };
+    return binding;
+}
 
+template <class P>
+Binding BufferCache<P>::ResolveStorageBufferBinding(GPUVAddr gpu_addr, u64 next_qword,
+                                                    u32 cbuf_index, bool is_written,
+                                                    bool native_pointer) const {
     u32 size = [&]() {
         const u32 memory_layout_size =
             static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
@@ -2669,7 +2696,6 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         if (native_pointer) {
             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }
-        const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
                                         packed_size != 0 &&

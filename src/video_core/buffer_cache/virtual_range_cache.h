@@ -38,7 +38,7 @@ public:
             entries.clear();
         }
         const size_t as_id = memory.GetID();
-        const u64 key = MakeKey(as_id, gpu_addr);
+        const u64 key = MakeKey(as_id, gpu_addr, size);
         const auto it = entries.find(key);
         if (it != entries.end() && it->second.as_id == as_id &&
             it->second.gpu_addr == gpu_addr && it->second.size == size) {
@@ -121,8 +121,11 @@ private:
         u64 size;
     };
 
-    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr) {
-        return (static_cast<u64>(as_id) << 48) ^ gpu_addr;
+    // The size is part of the key: shaders that bind one address at different sizes used to evict
+    // each other's entry on every bind.
+    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr, u32 size) {
+        return (static_cast<u64>(as_id) << 48) ^ gpu_addr ^
+               (static_cast<u64>(size) * 0x9E3779B97F4A7C15ULL);
     }
 
     void ApplyDeferred() {

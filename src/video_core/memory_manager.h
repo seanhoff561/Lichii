@@ -58,6 +58,12 @@ public:
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
 
+    /// Changes whenever a mapping does: what was worked out from the page tables under one value
+    /// holds for as long as the value does.
+    [[nodiscard]] u64 MappingGeneration() const noexcept {
+        return mapping_generation.load(std::memory_order_relaxed);
+    }
+
     inline size_t GetID() const noexcept {
         return unique_identifier;
     }
@@ -246,6 +252,7 @@ private:
 
     bool native_tiling{};
     mutable std::mutex guard;
+    std::atomic<u64> mapping_generation{};
 
     static constexpr size_t continuous_bits = 64;
 

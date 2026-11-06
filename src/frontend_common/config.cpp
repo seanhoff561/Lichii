@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -33,7 +34,13 @@ void Config::Initialize(const std::string& config_name) {
 
     switch (type) {
     case ConfigType::GlobalConfig:
-        config_loc = FS::PathToUTF8String(fs_config_loc / config_file);
+        // EDEN_NX2_CONFIG=<name>: <name>.ini in the config folder instead, so that scripted test
+        // runs can have their own input mapping without touching the player's settings.
+        if (const char* const name = std::getenv("EDEN_NX2_CONFIG")) {
+            config_loc = FS::PathToUTF8String(fs_config_loc / fmt::format("{}.ini", name));
+        } else {
+            config_loc = FS::PathToUTF8String(fs_config_loc / config_file);
+        }
         void(FS::CreateParentDir(config_loc));
         SetUpIni();
         Reload();
