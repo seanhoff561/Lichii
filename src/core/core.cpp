@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <atomic>
 #include <memory>
+#include <chrono>
+#include <string>
+#include <thread>
 #include <utility>
 
 #include "game_settings.h"
@@ -38,6 +41,7 @@
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/kernel.h"
@@ -71,6 +75,10 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
+
+namespace Kernel::Svc {
+extern std::atomic<int> g_wait_trace;
+}
 
 namespace Core {
 
@@ -628,8 +636,52 @@ void System::Initialize() {
     impl->Initialize(*this);
 }
 
+namespace {
+
+// EDEN_NX2_HANG_DUMP=<seconds>: log what every guest thread waits for, for a hang nobody can
+// attach to. Reads kernel state without locks; it is a diagnostic, not part of emulation.
+void DumpGuestThreads(System& system) {
+    Kernel::KProcess* const process = system.ApplicationProcess();
+    if (process == nullptr) {
+        return;
+    }
+    auto& memory = system.ApplicationMemory();
+    LOG_WARNING(Core, "Hang dump: code region {:#x}",
+                GetInteger(process->GetPageTable().GetCodeRegionStart()));
+    for (const Kernel::KThread& thread : process->GetThreadList()) {
+        const auto& context = thread.GetContext();
+        std::string frames;
+        u64 fp = context.fp;
+        for (int depth = 0; depth < 8 && fp != 0 && memory.IsValidVirtualAddress(fp); ++depth) {
+            frames += fmt::format(" {:#x}", memory.Read64(fp + 8));
+            fp = memory.Read64(fp);
+        }
+        LOG_WARNING(Core,
+                    "Hang dump: thread {} prio {} state {:#x} wait {} core {} pc {:#x} lr {:#x} "
+                    "key {:#x}/{:#x} frames{}",
+                    thread.GetThreadId(), thread.GetPriority(),
+                    static_cast<u32>(thread.GetRawState()),
+                    static_cast<u32>(thread.GetWaitReasonForDebugging()), thread.GetActiveCore(),
+                    context.pc, context.lr, GetInteger(thread.GetAddressKey()),
+                    thread.GetAddressArbiterKey(), frames);
+    }
+}
+
+} // namespace
+
 void System::Run() {
     impl->Run();
+    static std::atomic_flag hang_dump_started = ATOMIC_FLAG_INIT;
+    if (const char* seconds = std::getenv("EDEN_NX2_HANG_DUMP");
+        seconds != nullptr && !hang_dump_started.test_and_set()) {
+        std::thread([this, delay = std::atoi(seconds)] {
+            for (int dump = 0; dump < 3; ++dump) {
+                std::this_thread::sleep_for(std::chrono::seconds(delay));
+                DumpGuestThreads(*this);
+                Kernel::Svc::g_wait_trace.store(60, std::memory_order_relaxed);
+            }
+        }).detach();
+    }
 }
 
 void System::Pause() {

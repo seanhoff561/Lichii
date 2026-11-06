@@ -4,14 +4,21 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <string>
+
+#include <fmt/format.h>
+
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
+#include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/memory.h"
 
 namespace Kernel::Svc {
 
@@ -53,6 +60,8 @@ Result ResetSignal(Core::System& system, Handle handle) {
 }
 
 /// Wait for the given handles to synchronize, timeout after the specified nanoseconds
+std::atomic<int> g_wait_trace{0};
+
 Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_handles,
                            int32_t num_handles, int64_t timeout_ns) {
     LOG_TRACE(Kernel_SVC, "called user_handles={:#x}, num_handles={}, timeout_ns={}", user_handles,
@@ -81,6 +90,29 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
             objs[i]->Close(system.Kernel());
         }
     };
+
+    if (g_wait_trace.load(std::memory_order_relaxed) > 0) [[unlikely]] {
+        g_wait_trace.fetch_sub(1, std::memory_order_relaxed);
+        Svc::ThreadContext context{};
+        GetCurrentProcess(system.Kernel())
+            .GetArmInterface(GetCurrentCoreId(system.Kernel()))
+            ->GetContext(context);
+        auto& memory = GetCurrentMemory(system.Kernel());
+        std::string text;
+        for (auto i = 0; i < num_handles; ++i) {
+            text += fmt::format(" {:#x}:{}:{}", handles[i], objs[i]->GetTypeName(),
+                                objs[i]->IsSignaled(system.Kernel()));
+        }
+        text += " frames";
+        u64 fp = context.fp;
+        text += fmt::format(" {:#x}", context.lr);
+        for (int depth = 0; depth < 10 && fp != 0 && memory.IsValidVirtualAddress(fp); ++depth) {
+            text += fmt::format(" {:#x}", memory.Read64(fp + 8));
+            fp = memory.Read64(fp);
+        }
+        LOG_WARNING(Kernel_SVC, "Hang dump: wait thread {} timeout {} handles{}",
+                    GetCurrentThread(system.Kernel()).GetThreadId(), timeout_ns, text);
+    }
 
     // Convert the timeout from nanoseconds to ticks.
     s64 timeout;

@@ -449,7 +449,12 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
             return value == nullptr || value[0] != '0';
         }();
-        if (snapshot && channel_state->memory_manager && channel_state->payload) {
+        // Maps run in order on the GPU thread, so a list in memory mapped just before this
+        // submission can still be unmapped here: the copy read zeros, the GPU ran nothing and the
+        // game waited forever at boot (timing dependent, about one boot in three with the GPU
+        // threads pinned). Read at parse time instead: the maps run first.
+        if (snapshot && channel_state->memory_manager && channel_state->payload &&
+            !gpu.MapsPending()) {
             // Before the copy: a suspension during it must count as one after it.
             entries.snapshot_suspensions =
                 channel_state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
