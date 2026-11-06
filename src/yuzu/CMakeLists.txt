@@ -410,6 +410,12 @@ elseif(WIN32)
     endif()
 endif()
 
+if (MSVC AND LICHII_PGO STREQUAL "instrument")
+    target_link_options(yuzu PRIVATE /LTCG /CGTHREADS:8 "/GENPROFILE:PGD=${LICHII_PGD}")
+elseif (MSVC AND LICHII_PGO STREQUAL "use")
+    target_link_options(yuzu PRIVATE /LTCG /CGTHREADS:8 "/USEPROFILE:PGD=${LICHII_PGD}")
+endif()
+
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
 target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent Qt6::Network)

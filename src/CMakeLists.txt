@@ -140,9 +140,16 @@ if (MSVC AND NOT CXX_CLANG)
         )
     endif()
 
-    if (ARCHITECTURE_x86_64)
+    # Pads branches for a Skylake-era microcode mitigation; everything else just runs larger code.
+    option(LICHII_INTEL_JCC_ERRATUM "Build with /QIntel-jcc-erratum" OFF)
+    if (ARCHITECTURE_x86_64 AND LICHII_INTEL_JCC_ERRATUM)
         add_compile_options(/QIntel-jcc-erratum)
     endif()
+
+    # Profile-guided, whole-program build of the GPU code. Build with "instrument", play with the
+    # result (pgort140.dll next to the exe; pgosweep saves the counts), then build with "use".
+    set(LICHII_PGO "" CACHE STRING "MSVC profile guided optimization: empty, instrument or use")
+    set(LICHII_PGD "${CMAKE_BINARY_DIR}/lichii.pgd" CACHE FILEPATH "Profile database")
 
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG   "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)

@@ -263,4 +263,8 @@ if(ANDROID)
     target_link_libraries(common PRIVATE android)
 endif()
 
+if (MSVC AND LICHII_PGO)
+    target_compile_options(common PRIVATE /GL)
+endif()
+
 create_target_directory_groups(common)
