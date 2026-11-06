@@ -97,6 +97,16 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
+    // Within a page the guest bytes can be compared where they are: most binds repeat the last
+    // bytes and need no copy at all.
+    constexpr u64 PageSize = 4096;
+    const bool one_page = (device_addr & (PageSize - 1)) + size <= PageSize;
+    const u8* const direct = one_page ? device_memory.template GetPointer<u8>(device_addr) : nullptr;
+    if (direct != nullptr && slot.size == size && slot.tick == runtime.CurrentTick() &&
+        std::memcmp(slot.bytes.data(), direct, size) == 0) {
+        runtime.RebindStreamUniform(slot.ref, size);
+        return true;
+    }
     u8* const scratch = reuse.scratch.data();
     device_memory.ReadBlockUnsafe(device_addr, scratch, size);
 

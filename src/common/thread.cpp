@@ -568,6 +568,22 @@ size_t Unwind(CONTEXT context, u64 base, u64 end, const RUNTIME_FUNCTION* functi
               u64 stack_limit, u64* out) {
     size_t frames = 0;
     __try {
+        // Through system libraries with their own unwind data (a blocked lock, a heap call).
+        for (u32 hops = 0; hops < 16 && (context.Rip < base || context.Rip >= end); ++hops) {
+            DWORD64 image_base{};
+            const auto* const entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+            if (entry == nullptr) {
+                break;
+            }
+            PVOID handler_data{};
+            DWORD64 establisher{};
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip,
+                             const_cast<PRUNTIME_FUNCTION>(entry), &context, &handler_data,
+                             &establisher, nullptr);
+            if (context.Rsp == 0 || context.Rsp >= stack_limit) {
+                return 0;
+            }
+        }
         if (context.Rip < base || context.Rip >= end) {
             // Find a return address into the executable on the stack.
             bool found = false;
@@ -628,6 +644,8 @@ void Run() {
         std::unordered_map<u64, u32> edges; ///< (frame << 32) | its caller's frame
         /// Samples outside the executable: (module << 32) | the first executable frame.
         std::unordered_map<u64, u32> outside;
+        /// The same samples by (module << 32) | offset in the module, in 16 byte steps.
+        std::unordered_map<u64, u32> outside_rva;
     };
     std::map<std::string, Profile> profiles;
     std::vector<std::string> modules;
@@ -690,6 +708,15 @@ void Run() {
             if ((rip < base || rip >= end) && unwound_count != 0) {
                 ++profile.outside[(module_index(rip) << 32) | unwound[0]];
             }
+            if (rip < base || rip >= end) {
+                HMODULE owner{};
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       reinterpret_cast<LPCSTR>(rip), &owner)) {
+                    const u64 rva = (rip - reinterpret_cast<u64>(owner)) & ~u64{15};
+                    ++profile.outside_rva[(module_index(rip) << 32) | rva];
+                }
+            }
             // Inclusive counts: each frame of the unwound stack once (recursion counted once).
             (void)read;
             for (size_t i = 0; i < unwound_count; ++i) {
@@ -743,6 +770,14 @@ void Run() {
             }
             LOG_INFO(Common, "Sample profile {} ({} samples) outside:{}", name, profile.samples,
                      outside);
+            std::string rvas;
+            for (const auto& [key, count] : profile.outside_rva) {
+                if (100.0 * count / profile.samples >= 0.1) {
+                    rvas += fmt::format(" {}+{:#x}:{:.1f}", modules[key >> 32], key & 0xffffffff,
+                                        100.0 * count / profile.samples);
+                }
+            }
+            LOG_INFO(Common, "Sample profile {} ({} samples) rva:{}", name, profile.samples, rvas);
         }
         profiles.clear();
     }

@@ -1305,4 +1305,10 @@ if (ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
+if (MSVC AND LICHII_PGO)
+    target_compile_options(core PRIVATE /GL)
+    # As above: fibers migrate between host threads.
+    set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS /GL-)
+endif()
+
 create_target_directory_groups(core)
