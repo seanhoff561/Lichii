@@ -238,7 +238,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            std::vector<std::function<void()>> operations;
             u8 flushes;
         };
         std::vector<Released> batch;
@@ -382,8 +382,9 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    // Vectors: a deque of these allocates a block per element, for every query and fence.
+    std::vector<std::function<void()>> uncommitted_operations;
+    std::deque<std::vector<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
 

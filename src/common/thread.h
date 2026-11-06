@@ -108,6 +108,11 @@ enum class ThreadPlacement : u32 {
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
+
+/// Gives the calling thread a physical core of its own for the rest of the process's life: one of
+/// the core's two logical processors, with every other thread of the process kept off both.
+/// Windows only, on 8 or more cores, with EDEN_NX2_PIN=1.
+void ReserveCoreForCurrentThread();
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();

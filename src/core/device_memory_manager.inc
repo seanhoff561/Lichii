@@ -709,6 +709,12 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
     if (ranges.empty()) {
         return;
     }
+    if (ranges.size() == 1) {
+        const auto [addr, size] = ranges.front();
+        Common::ScopedRangeLock lk(counter_guard, addr, size);
+        UpdatePagesCachedCountNoLock(addr, size, delta);
+        return;
+    }
     // Make a local copy and sort by address
     std::vector<std::pair<DAddr, size_t>> tmp(ranges.begin(), ranges.end());
     std::sort(tmp.begin(), tmp.end(), [](const auto& a, const auto& b) { return a.first < b.first; });

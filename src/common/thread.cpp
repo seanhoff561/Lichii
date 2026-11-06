@@ -807,6 +807,67 @@ void SetCurrentThreadName(const char* name) {
 #endif
 }
 
+void ReserveCoreForCurrentThread() {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::vector<u32> reserved_cores;
+    std::scoped_lock lock{mutex};
+    ULONG length = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+    std::vector<u8> buffer(length);
+    if (!GetSystemCpuSetInformation(
+            reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length,
+            GetCurrentProcess(), 0)) {
+        return;
+    }
+    struct Set {
+        ULONG id;
+        u32 core;
+    };
+    std::vector<Set> sets;
+    std::vector<u32> cores;
+    for (ULONG offset = 0; offset < length;) {
+        const auto* const info =
+            reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Type == CpuSetInformation) {
+            sets.push_back({info->CpuSet.Id, info->CpuSet.CoreIndex});
+            if (std::find(cores.begin(), cores.end(), info->CpuSet.CoreIndex) == cores.end()) {
+                cores.push_back(info->CpuSet.CoreIndex);
+            }
+        }
+        offset += info->Size;
+    }
+    if (cores.size() < 8) {
+        return;
+    }
+    // From the second core up: the first takes most of the system's interrupts.
+    const u32 core = cores[1 + reserved_cores.size()];
+    reserved_cores.push_back(core);
+    std::vector<ULONG> others;
+    ULONG own = 0;
+    for (const Set& set : sets) {
+        if (set.core == core && own == 0) {
+            own = set.id;
+        }
+        if (std::find(reserved_cores.begin(), reserved_cores.end(), set.core) ==
+            reserved_cores.end()) {
+            others.push_back(set.id);
+        }
+    }
+    SetThreadSelectedCpuSets(GetCurrentThread(), &own, 1);
+    SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
+                             static_cast<ULONG>(others.size()));
+    LOG_INFO(Common, "Reserved core {} for this thread, {} sets for the rest", core, others.size());
+#endif
+}
+
 void SetCurrentThreadToPerformanceCores() {
 #if defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Render)) {
