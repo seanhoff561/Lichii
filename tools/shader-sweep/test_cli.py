@@ -307,7 +307,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48, 49, 50):
+        for version in (46, 47, 48, 49, 50, 51, 52):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))

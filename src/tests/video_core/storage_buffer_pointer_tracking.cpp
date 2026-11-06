@@ -297,7 +297,7 @@ TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
         ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
                          ir.Imm32(1));
 
-        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110});
+        const std::vector<u32> offsets{fixture.TrackedOffsets()};
         const auto has = [&](IR::Opcode opcode) {
             return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
                 return inst.GetOpcode() == opcode;
@@ -306,8 +306,31 @@ TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
         CHECK(has(IR::Opcode::LoadStorage64));
         CHECK(has(IR::Opcode::WriteGlobal32));
         CHECK_FALSE(has(IR::Opcode::WriteStorage32));
-        REQUIRE(fixture.program.info.storage_buffers_descriptors.size() == 1);
-        CHECK_FALSE(fixture.program.info.storage_buffers_descriptors.front().is_written);
+        const auto& descriptors{fixture.program.info.storage_buffers_descriptors};
+        if (!native) {
+            CHECK(offsets == std::vector<u32>{0x110});
+            REQUIRE(descriptors.size() == 1);
+            CHECK_FALSE(descriptors.front().is_written);
+            continue;
+        }
+        // A native program also binds the buffer the loaded pointer points to, as its own
+        // descriptor read through the source: the write stays global and the source unwritten.
+        CHECK(offsets == std::vector<u32>{0x110, 0x110});
+        REQUIRE(descriptors.size() == 2);
+        const auto source_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.indirect_offset == ~0U; })};
+        REQUIRE(source_descriptor != descriptors.end());
+        CHECK(source_descriptor->cbuf_index == 0);
+        CHECK(source_descriptor->cbuf_offset == 0x110);
+        CHECK_FALSE(source_descriptor->is_written);
+        CHECK(std::ranges::count_if(descriptors,
+                                    [](const auto& desc) { return desc.is_written; }) == 1);
+        const auto loaded_descriptor{std::ranges::find_if(
+            descriptors, [](const auto& desc) { return desc.is_written; })};
+        REQUIRE(loaded_descriptor != descriptors.end());
+        CHECK(loaded_descriptor->cbuf_index == 0);
+        CHECK(loaded_descriptor->cbuf_offset == 0x110);
+        CHECK(loaded_descriptor->indirect_offset == 0);
     }
 }
 

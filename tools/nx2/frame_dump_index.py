@@ -35,6 +35,10 @@ def card(entry):
         title = f"pass {entry['pass']} rt{entry['slot']} · draws {entry['first_draw']}+{entry['draw_count']}"
     elif kind == "dispatch":
         title = f"dispatch {entry['dispatch']} img{entry['slot']} · after draw {entry['after_draws']}"
+    elif kind == "sampled" and "dispatch" in entry:
+        title = f"dispatch {entry['dispatch']} samples tic {entry['tic']} · after draw {entry['after_draws']}"
+    elif kind == "sampled":
+        title = f"pass {entry['pass']} samples tic {entry['tic']} (stage {entry['stage']}) · draw {entry['draw']}"
     else:
         title = f"present · after draw {entry.get('after_draws', '?')}"
     png = entry.get("png")
@@ -42,7 +46,8 @@ def card(entry):
              if png else '<div class="noimg">no preview</div>')
     rows = [
         ("format", f"{entry.get('format', '?')} {entry.get('width', '?')}x{entry.get('height', '?')}"
-                   f" L{entry.get('level', 0)}/{entry.get('layer', 0)}"
+                   + (f"x{entry['depth']}" if entry.get("depth", 1) > 1 else "")
+                   + f" L{entry.get('level', 0)}/{entry.get('layer', 0)}"
                    + (" rescaled" if entry.get("rescaled") else "")),
         ("gpu", entry.get("gpu_addr", "-")),
         ("shaders", " ".join(entry.get("shaders", [])) or "-"),
@@ -62,7 +67,7 @@ STYLE = """
 body{font:12px system-ui,sans-serif;background:#1b1b1f;color:#ddd;margin:16px}
 h1{font-size:16px}.grid{display:flex;flex-wrap:wrap;gap:10px}
 .card{background:#26262c;border-left:4px solid #555;padding:6px;width:300px}
-.card.pass{border-color:#4a8}.card.dispatch{border-color:#a84}.card.present{border-color:#48c}
+.card.pass{border-color:#4a8}.card.sampled{border-color:#86c}.card.dispatch{border-color:#a84}.card.present{border-color:#48c}
 .t{font-weight:600;margin-bottom:4px}.n{color:#888;word-break:break-all;margin-top:4px}
 img{max-width:300px;max-height:220px;display:block;background:repeating-conic-gradient(#333 0 25%,#2a2a2a 0 50%) 0 0/16px 16px}
 .noimg{height:60px;display:flex;align-items:center;justify-content:center;color:#777;border:1px dashed #444}
@@ -85,6 +90,8 @@ def main():
             header = entry
         elif entry.get("kind") == "summary":
             summary = entry
+        elif entry.get("kind") in ("buffer", "launch"):
+            continue
         else:
             entries.append(entry)
     info = (f"frame {header.get('frame', '?')} at {header.get('seconds', '?')} s · "

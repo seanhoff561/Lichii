@@ -84,6 +84,9 @@ struct TextureTranslation {
     std::array<u32, IR::NUM_REGS> registers{};
     Vector sample{0x3f800000, 0xbf000000, 0x3e800000, 0x3f400000};
     Vector coordinates{};
+    Vector offsets{}, offsets2{};
+    u32 handle{0x110};
+    u32 component{};
     u32 level{};
     u32 textures{};
 
@@ -93,9 +96,11 @@ struct TextureTranslation {
             if ((word >> 48) == 0xe300) {
                 continue;
             }
-            REQUIRE(((word >> 16) & 15) == guard);
+            REQUIRE(((word >> 16) & 15) == ((word >> 56) == 0x01 ? 7U : guard));
             if ((word >> 48) == 0x5c98) {
                 visitor.MOV_reg(word);
+            } else if ((word >> 56) == 0x01) {
+                visitor.MOV32I(word);
             } else if ((word >> 48) == 0x4c98) {
                 visitor.MOV_cbuf(word);
             } else if ((word >> 48) == 0x5ca8) {
@@ -104,7 +109,7 @@ struct TextureTranslation {
                 visitor.ISCADD_reg(word);
             } else if ((word >> 56) == 0xd2) {
                 visitor.TLDS(word);
-            } else if ((word >> 56) == 0xc8) {
+            } else if ((word >> 58) == 0x32) {
                 visitor.TLD4(word);
             } else if ((word >> 56) == 0xde) {
                 visitor.TEX_b(word);
@@ -143,13 +148,23 @@ struct TextureTranslation {
             case IR::Opcode::CompositeConstructF16x2:
                 result = {arg(0), arg(1)};
                 break;
+            case IR::Opcode::CompositeConstructU32x4:
+                result = {arg(0), arg(1), arg(2), arg(3)};
+                break;
+            case IR::Opcode::BitFieldSExtract:
+                result[0] = static_cast<u32>(static_cast<s32>(arg(0) << (32 - arg(1) - arg(2))) >> (32 - arg(2)));
+                break;
             case IR::Opcode::BoundImageFetch:
             case IR::Opcode::BoundImageGather:
-                REQUIRE(arg(0) == 0x110);
+                REQUIRE(arg(0) == handle);
                 coordinates = read(inst.Arg(1));
                 if (inst.GetOpcode() == IR::Opcode::BoundImageFetch) {
                     level = arg(3);
                     REQUIRE(inst.Flags<IR::TextureInstInfo>().relaxed_precision == 1);
+                } else {
+                    component = inst.Flags<IR::TextureInstInfo>().gather_component;
+                    if (!inst.Arg(2).IsEmpty()) offsets = read(inst.Arg(2));
+                    if (!inst.Arg(3).IsEmpty()) offsets2 = read(inst.Arg(3));
                 }
                 result = sample;
                 ++textures;
@@ -289,6 +304,60 @@ TEST_CASE("Welcome Tour logged half gathers round and pack both destination orde
     }
 }
 
+TEST_CASE("Ampere half per-tap gathers round and pack each pair in low-high order",
+          "[video_core][ampere][gather][logged_textures]") {
+    // nvdisasm -b SM87, old negative case with bit 79 set:
+    // TLD4.SCR.R.F16.RN.PTP.NODEP R8, R10, R4, R8, 0xe, 0x4, 2D ;
+    const Instruction former_negative{{0x040a7b63, 0x33800408, 0x041eaf08, 0x100fc200}};
+    const Instruction captured{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    for (const auto& capture : {former_negative, captured}) {
+        for (const u32 component : {0U, 1U, 2U, 3U}) {
+            for (const u32 guard : {1U, 7U, 9U}) {
+                auto gather = capture;
+                gather.words[0] = (gather.words[0] & ~0xf000U) | (guard << 12);
+                gather.words[2] = (gather.words[2] & ~(3U << 23)) | (component << 23);
+                const u32 meta = gather.Bits(32, 8);
+                const std::array code{
+                    Instruction{{0x00007802U | (meta << 16), 0xff00ff00, 0xf00, 0}},
+                    Instruction{{0x00007802U | ((meta + 1) << 16), 0x01000001, 0xf00, 0}},
+                    gather, Exit,
+                };
+                auto lowered = Shader::Ampere::LowerToMaxwell(code);
+                INFO(lowered.error);
+                REQUIRE(lowered);
+                lowered.instructions.erase(lowered.instructions.begin(),
+                    lowered.instructions.begin() + lowered.source_instruction_offsets[2]);
+                TextureTranslation translated;
+                translated.env.binding = lowered.required_texture_buffer;
+                translated.handle = gather.Bits(40, 14) * 4;
+                translated.registers.fill(0xdeadbeef);
+                translated.registers[gather.Bits(24, 8)] = 0x3e000000;
+                translated.registers[gather.Bits(24, 8) + 1] = 0x3f400000;
+                translated.sample = {0x3f801000, 0x3f801001, 0x80000000, 0x3f400000};
+                const auto before = translated.registers;
+                translated.Translate(lowered, guard);
+                translated.Run();
+                CHECK(translated.textures == 1);
+                CHECK(translated.component == component);
+                CHECK(translated.coordinates == TextureTranslation::Vector{0x3e000000, 0x3f400000});
+                CHECK(translated.offsets == TextureTranslation::Vector{0, 0xffffffff, 0, 0xffffffff});
+                CHECK(translated.offsets2 == TextureTranslation::Vector{1, 0, 0, 1});
+                CHECK(translated.registers[gather.Bits(16, 8)] == 0x3c013c00);
+                CHECK(translated.registers[gather.Bits(64, 8)] == 0x3a008000);
+                for (u32 reg = 0; reg < 246; ++reg) {
+                    if (reg != gather.Bits(16, 8) && reg != gather.Bits(64, 8))
+                        REQUIRE(translated.registers[reg] == before[reg]);
+                }
+                for (const u32 rounding : {2U, 3U}) {
+                    auto invalid = code;
+                    invalid[2].words[2] = (invalid[2].words[2] & ~(3U << 15)) | (rounding << 15);
+                    CHECK_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("Logged half textures retain unsupported-mode rejections",
           "[video_core][ampere][logged_textures]") {
     for (const u32 bit : {76U, 77U, 78U, 80U, 91U}) {
@@ -337,6 +406,58 @@ TEST_CASE("Welcome Tour logged half textures reach production SPIRV emission",
     }
 }
 
+TEST_CASE("Guarded per-tap gathers retain immediate offsets through SPIRV translation",
+          "[video_core][ampere][gather][logged_textures]") {
+    for (const bool half : {false, true}) {
+        for (const u32 guard : {1U, 9U}) {
+            const std::array native{
+                Instruction{{0x000e7919, 0, 0x2100, 0}},
+                Instruction{{0x0e00720c, 0xff, 0x03f25070, 0}},
+                Instruction{{(0xff107424U & ~0xf000U) | (guard << 12), 0xfffeffff, 0x078e00ff, 0}},
+                Instruction{{(0xff117424U & ~0xf000U) | (guard << 12), 0xfffcfffd, 0x078e00ff, 0}},
+                Instruction{{(0x06187b63U & ~0xf000U) | (guard << 12), 0x30007c10,
+                             0x001e2f0eU | (half ? 1U << 15 : 0U), 0}},
+                Exit,
+            };
+            const auto lowered = Shader::Ampere::LowerToMaxwell(native);
+            INFO(lowered.error);
+            REQUIRE(lowered);
+            auto code = lowered.instructions;
+            for (const u32 reg : {14U, 24U})
+                code.insert(code.end() - 1, 0xef58000000070000ULL | reg | (255ULL << 8) |
+                    (u64{reg * 4} << 20) | (4ULL << 48));
+            TextureEnvironment env;
+            env.code = code;
+            env.binding = lowered.required_texture_buffer;
+            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+            Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{0x50}};
+            Shader::ObjectPool<IR::Inst> inst_pool;
+            Shader::ObjectPool<IR::Block> block_pool;
+            Shader::HostTranslateInfo host;
+            host.ApplyDescriptorLimitPolicy();
+            auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+            u32 gathers = 0;
+            for (const auto* block : program.blocks) {
+                for (const auto& inst : *block) {
+                    if (inst.GetOpcode() != IR::Opcode::ImageGather) continue;
+                    ++gathers;
+                    for (const u32 argument : {2U, 3U}) {
+                        const auto* offsets = inst.Arg(argument).InstRecursive();
+                        REQUIRE(offsets->GetOpcode() == IR::Opcode::CompositeConstructU32x4);
+                        REQUIRE(offsets->AreAllArgsImmediates());
+                    }
+                }
+            }
+            REQUIRE(gathers == 1);
+            Shader::Profile profile{};
+            profile.supported_spirv = 0x00010400;
+            const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+            REQUIRE(spirv.size() > 5);
+            CHECK(spirv.front() == 0x07230203);
+        }
+    }
+}
+
 TEST_CASE("Half gathers reject reserved second coordinates before scratch copies",
           "[video_core][ampere][logged_textures]") {
     for (u32 source = 246; source < 255; ++source) {
@@ -374,4 +495,24 @@ TEST_CASE("Half gathers reject reserved second coordinates before scratch copies
             CHECK(static_cast<bool>(lowered) == (source < limit || source == 255));
         }
     }
+}
+
+TEST_CASE("Half per-tap gathers prove offsets across an unrelated LEA.HI",
+          "[video_core][ampere][gather][logged_textures]") {
+    // Ocarina of Time 1080p upscaler (native program at 0x11491edc00), nvdisasm -b SM87:
+    // LEA.HI R8, R8, R7, RZ, 0x1f ; between the offset moves and
+    // TLD4.SCR.R.F16.RN.PTP R12, R10, R10, R0, 0x0, 0x30, 2D ;
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    auto code = std::array{
+        Instruction{{0x00007802, 0xff00ff00, 0xf00, 0}},
+        Instruction{{0x00017802, 0x01000001, 0xf00, 0}},
+        lea, gather, Exit,
+    };
+    const auto lowered = Shader::Ampere::LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    code[2].words[0] = 0x08017211;
+    CHECK(Shader::Ampere::LowerToMaxwell(code).error ==
+          "native per-tap gather nonconstant offsets");
 }

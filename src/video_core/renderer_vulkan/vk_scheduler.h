@@ -25,6 +25,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -119,11 +120,11 @@ public:
         std::source_location location = std::source_location::current());
 
     void DeferFragmentBarrier() {
-        fragment_barrier_pending = state.renderpass != VK_NULL_HANDLE;
+        fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
     }
 
-    bool TakeFragmentBarrier() {
-        return std::exchange(fragment_barrier_pending, false);
+    bool HasFragmentBarrier() const {
+        return fragment_barrier.Pending();
     }
 
     void NoteRenderPassStores() {
@@ -141,6 +142,15 @@ public:
 
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+
+    /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
+    /// recorded after it must be dropped instead of reaching the driver without a pipeline.
+    void SetGraphicsPipelineMissing(bool missing) {
+        graphics_pipeline_missing = missing;
+    }
+    [[nodiscard]] bool GraphicsPipelineMissing() const {
+        return graphics_pipeline_missing;
+    }
 
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling, bool mesh_layout);
@@ -199,6 +209,12 @@ public:
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
+    }
+
+    /// Changes whenever recorded command buffer state may have been reset (InvalidateState, the
+    /// end of a render pass), so a binding recorded at the same epoch is still bound.
+    [[nodiscard]] u64 RecordingEpoch() const noexcept {
+        return recording_epoch;
     }
 
     /// Returns true when a tick has been triggered by the GPU.
@@ -425,8 +441,9 @@ private:
     StateTracker& state_tracker;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
-    bool fragment_barrier_pending{};
+    FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
 
     vk::QueryPool trace_query_pool;
@@ -479,6 +496,7 @@ private:
     std::function<void()> on_submit;
 
     State state;
+    u64 recording_epoch = 0;
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

@@ -48,6 +48,40 @@ Keep changes focused and distinguish code-level checks from actual gameplay test
 Art created by YOB (yobslab)
 The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
 
+## Support Lichii
+
+Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
+
+**Solana (SOL)**
+```text
+JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
+```
+
+**Ethereum (ETH)**
+```text
+0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
+```
+
+**Bitcoin (BTC)**
+```text
+bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
+```
+
+**BNB Smart Chain (BNB)**
+```text
+0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
+```
+
+**Polygon**
+```text
+0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
+```
+
+Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
+
+> [!NOTE]
+> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
+
 ## Credits and license
 
 Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
