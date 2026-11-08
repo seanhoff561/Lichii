@@ -24,7 +24,10 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include <fmt/format.h>
+
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -140,6 +143,7 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    guest_writes.fill(0);
     last_sync_position = 0;
     published_local = 0;
     consumed_cache = 0;
@@ -199,6 +203,16 @@ void GpuSplit::Publish() {
     }
 }
 
+void GpuSplit::NotifyFront() {
+    if (front_waiting.load(std::memory_order_seq_cst)) {
+        if (Nx2Spike::Enabled()) {
+            last_front_wake_ns.store(Nx2Spike::NowNs(), std::memory_order_relaxed);
+        }
+        front_wake.fetch_add(1, std::memory_order_seq_cst);
+        front_wake.notify_one();
+    }
+}
+
 void GpuSplit::Drain(DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
@@ -206,6 +220,7 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Spike::Timer spike_timer{Nx2Spike::Counter::FrontWaitNs};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -218,8 +233,31 @@ void GpuSplit::Drain(DrainSite site) {
     }
 }
 
-bool GpuSplit::WaitForWriters() {
-    return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+std::string GpuSplit::DebugState() const {
+    return fmt::format("write {} published {} local {} consumed {} wait target {} back waiting {} "
+                       "front waiting {} hook {} wake {} front wake {} last writer {}",
+                       write_position, published.load(), published_local, consumed.load(),
+                       wait_target.load(), back_waiting.load(), front_waiting.load(),
+                       hook_requested.load(), wake.load(), front_wake.load(),
+                       last_writer_position);
+}
+
+bool GpuSplit::WaitForWriters(DrainSite site) {
+    return WaitFor(std::min(last_writer_position, write_position), site);
+}
+
+bool GpuSplit::WaitForGuestWrites(GPUVAddr address, size_t bytes, DrainSite site) {
+    const u64 first = address >> 4;
+    const u64 last = (address + bytes - 1) >> 4;
+    u64 target = 0;
+    if (last - first >= guest_writes.size()) {
+        target = write_position;
+    } else {
+        for (u64 granule = first; granule <= last; ++granule) {
+            target = std::max(target, guest_writes[granule % guest_writes.size()]);
+        }
+    }
+    return target != 0 && WaitFor(std::min(target, write_position), site);
 }
 
 bool GpuSplit::WaitForSync() {
@@ -232,6 +270,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    Nx2Spike::Timer spike_timer{Nx2Spike::Counter::FrontWaitNs};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -246,6 +285,19 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     }
 }
 
+namespace {
+// EDEN_NX2_SPLIT_SPIN=1: the two GPU threads spin instead of sleeping when they wait for each
+// other. With EDEN_NX2_PIN each has a core of its own, so this costs power, not other threads'
+// time, and takes the kernel's wake out of the path between them.
+bool SplitSpin() {
+    static const bool spin = [] {
+        const char* const value = std::getenv("EDEN_NX2_SPLIT_SPIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    return spin;
+}
+} // Anonymous namespace
+
 void GpuSplit::Backoff(u32 spins, u64 target) {
     if (spins < 16384) {
         Pause();
@@ -255,12 +307,22 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         std::this_thread::yield();
         return;
     }
+    if (SplitSpin()) {
+        Pause();
+        return;
+    }
     // A long wait sleeps until the back stores a new position (port of #161's front_wake): the
     // back checks front_waiting after each store, the front checks the position after setting it.
     front_waiting.store(true, std::memory_order_seq_cst);
     const u32 seen = front_wake.load(std::memory_order_seq_cst);
     if (consumed.load(std::memory_order_seq_cst) < target) {
+        Nx2Spike::Timer sleep_timer{Nx2Spike::Counter::FrontSleepNs};
         front_wake.wait(seen, std::memory_order_seq_cst);
+        if (Nx2Spike::Enabled()) {
+            const u64 woken_at = last_front_wake_ns.load(std::memory_order_relaxed);
+            const u64 now = Nx2Spike::NowNs();
+            Nx2Spike::Add(Nx2Spike::Counter::WakeLateNs, now > woken_at ? now - woken_at : 0);
+        }
     }
     front_waiting.store(false, std::memory_order_relaxed);
 }
@@ -423,6 +485,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+            Nx2Spike::Timer spike_timer{Nx2Spike::Counter::BackIdleNs};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -431,9 +494,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position && idle_hook != nullptr) {
+                Nx2Spike::Timer hook_timer{Nx2Spike::Counter::BackHookNs};
                 hook_requested.store(false, std::memory_order_seq_cst);
                 idle_hook(idle_argument);
                 available = published.load(std::memory_order_acquire);
+            }
+            if (available == read_position && SplitSpin()) {
+                continue;
             }
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look

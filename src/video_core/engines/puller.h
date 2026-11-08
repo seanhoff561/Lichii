@@ -87,6 +87,7 @@ public:
         return pending_acquire.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
+    [[nodiscard]] static bool MatchesQueuedRelease(const PendingAcquire& acquire);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
 

@@ -99,6 +99,9 @@ private:
     vk::SurfaceKHR surface;
 
     Device device;
+#ifdef EGLANTINE_STREAMLINE
+    bool streamline_surface; ///< DLSS frame generation's surface comes after the device.
+#endif
     MemoryAllocator memory_allocator;
     StateTracker state_tracker;
     Scheduler scheduler;
@@ -114,6 +117,7 @@ private:
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+    u32 applet_capture_age{};
 };
 
 } // namespace Vulkan

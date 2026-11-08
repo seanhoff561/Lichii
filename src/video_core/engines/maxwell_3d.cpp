@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +28,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -1183,6 +1185,16 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        const GPUVAddr address =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        split.NoteGuestWrite(address);
+        split.NoteGuestWrite(address + 12);
+    } else if (method == MAXWELL3D_REG_INDEX(launch_dma) ||
+               method == MAXWELL3D_REG_INDEX(inline_data)) {
+        split.NoteWriter();
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1216,6 +1228,12 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         return;
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
+    bool inline_upload = false;
+    SCOPE_EXIT {
+        if (inline_upload) {
+            split.NoteWriter();
+        }
+    };
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
         return fs.control == Regs::ShadowRamControl::Track ||
@@ -1225,6 +1243,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += amount * sizeof(u32);
     } else if (method == MAXWELL3D_REG_INDEX(inline_data)) {
         // Upload data only.
+        inline_upload = true;
     } else if ((method == MAXWELL3D_REG_INDEX(draw_inline_index) ||
                 method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ||
                 method == MAXWELL3D_REG_INDEX(inline_index_4x8.index0)) &&
@@ -1357,7 +1376,75 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    // EDEN_NX2_MACRO_FAST: words on pages no GPU work wrote need only the work that can write
+    // guest memory to have run, not every draw queued behind it; waiting for all of them keeps
+    // the two halves of the split in lock step ~30,000 times a second. 2 reads both ways and
+    // reports differences.
+    static const int macro_fast = [] {
+        const char* const text = std::getenv("EDEN_NX2_MACRO_FAST");
+        return text ? std::atoi(text) : 0;
+    }();
+    bool fast = false;
+    if (macro_fast != 0) {
+        split.WaitForWriters(VideoCommon::DrainSite::MacroWriters);
+        split.WaitForGuestWrites(source, read_bytes, VideoCommon::DrainSite::MacroWriters);
+        fast = true;
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            fast = fast && device && !Tegra::Nx2IsGpuWritten(*device);
+        }
+    }
+    std::vector<u32> early_words;
+    bool early_gpu = false;
+    if (VideoCommon::Nx2Spike::Enabled()) {
+        early_words.resize(words);
+        memory_manager.ReadBlockUnsafe(source, early_words.data(), read_bytes);
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            early_gpu |= device && Tegra::Nx2IsGpuWritten(*device);
+        }
+        VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::MacroReads);
+        if (early_gpu) {
+            VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::MacroGpuWritten);
+        }
+        if (split.WritersQueued()) {
+            VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::MacroWritersQueued);
+        }
+    }
+    if (macro_fast != 1 || !fast) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    }
+    // Counter reports reach guest memory when a fence after them pops, so a drain alone leaves the
+    // words that were there before: last frame's counts. Title 1's macro 0xe2c reads ~20 of them
+    // at a time for its lighting, and each stale batch blew one frame out to white. The drain
+    // above left the back idle, so its query cache can be asked from here. Not in the fast path,
+    // whose back is still running: another reason MACRO_FAST=1 is off.
+    // The wait drains the frames in flight (~50 ms), so it is kept for batches: the cutscene
+    // lighting reads ~20 reports back to back, gameplay one or two now and then, where the wait
+    // cost a fifth of the frame rate. It starts at the EDEN_NX2_QUERY_WAIT-th pending report of
+    // a batch (default 3; 1: every one, 0: never).
+    static const s64 query_wait_from = [] {
+        const char* const value = std::getenv("EDEN_NX2_QUERY_WAIT");
+        return value ? std::strtoll(value, nullptr, 10) : s64{3};
+    }();
+    static std::chrono::steady_clock::time_point last_pending{};
+    static s64 pending_run = 0;
+    if (query_wait_from > 0 && (macro_fast != 1 || !fast) &&
+        VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source, read_bytes) &&
+        [] {
+            const auto now = std::chrono::steady_clock::now();
+            pending_run = now - last_pending < std::chrono::milliseconds{5} ? pending_run + 1 : 1;
+            last_pending = now;
+            return pending_run >= query_wait_from;
+        }()) {
+        split.Run(
+            [this] { rasterizer->WaitForQueryResults(); }, VideoCommon::DrainSite::MacroDmaFlush);
+        if (static u64 waits = 0; (++waits % 500) == 1) {
+            LOG_INFO(HW_GPU, "Macro read waited for query results ({} times)", waits);
+        }
+    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
@@ -1372,7 +1459,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+    if ((macro_fast != 1 || !fast) &&
+        memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
         split.Run(
             [memory = &memory_manager, source, read_bytes] {
                 memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
@@ -1380,8 +1468,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             VideoCommon::DrainSite::MacroDmaFlush);
     }
     u32 changed{};
+    bool early_differs = false;
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        early_differs |= !early_words.empty() && early_words[i] != word;
         if (method == 0x158) {
             fs.parameters.push_back(word);
         } else if (ram + i < native_data_ram.size()) {
@@ -1389,6 +1479,23 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
         if (!diag_before.empty() && diag_before[i] != word) {
             ++changed;
+        }
+    }
+    if (early_differs) {
+        if (static std::atomic<u32> reported{}; fast && reported.fetch_add(1) < 200) {
+            u32 first = 0;
+            while (first < words && early_words[first] == memory_manager.Read<u32>(
+                                                               source + u64{first} * sizeof(u32))) {
+                ++first;
+            }
+            LOG_INFO(HW_GPU, "NX2 macro read {:#x} method {:#x} at {:#x} words {}: word {} was {:#x} is {:#x}",
+                     macro, method, source, words, first,
+                     first < words ? early_words[first] : 0,
+                     first < words ? memory_manager.Read<u32>(source + u64{first} * sizeof(u32)) : 0);
+        }
+        VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::MacroChanged);
+        if (early_gpu) {
+            VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::MacroChangedGpu);
         }
     }
     if (Tegra::Nx2CmdPageDiag::g_enabled) {

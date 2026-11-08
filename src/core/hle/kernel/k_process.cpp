@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <random>
+#include <thread>
+#include <vector>
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -977,6 +981,8 @@ Result KProcess::Run(KernelCore& kernel, s32 priority, size_t stack_size) {
     };
 
     // Initialize the thread.
+    PrecompileBlocks();
+
     R_TRY(KThread::InitializeUserThread(kernel.System(), main_thread, this->GetEntryPoint(), 0,
                                         stack_top, priority, m_ideal_core_id, this));
 
@@ -1308,6 +1314,34 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
         }
     }
 #endif
+}
+
+void KProcess::PrecompileBlocks() {
+#ifdef HAS_NCE
+    if (this->IsApplication() && Settings::IsNceEnabled()) {
+        return;
+    }
+#endif
+    if (!this->Is64Bit()) {
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    std::atomic<std::size_t> compiled{};
+    {
+        std::vector<std::jthread> workers;
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            workers.emplace_back([this, i, &compiled] {
+                compiled += static_cast<Core::ArmDynarmic64*>(m_arm_interfaces[i].get())
+                                ->PrecompileBlocks();
+            });
+        }
+    }
+    if (compiled != 0) {
+        LOG_INFO(Kernel, "Compiled {} blocks of earlier sessions in {} ms", compiled.load(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - begin)
+                     .count());
+    }
 }
 
 void KProcess::InitializeInterfaces(KernelCore& kernel) {

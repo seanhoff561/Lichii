@@ -96,6 +96,10 @@
 
 // Qt Common //
 #include "qt_common/config/shared_translation.h"
+#include <QFileInfo>
+#include <QMessageBox>
+#include <QTimer>
+
 #include "qt_common/config/uisettings.h"
 
 #include "qt_common/abstract/frontend.h"
@@ -441,6 +445,30 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     UpdateWindowTitle();
 
+    // EDEN_NX2_HIDDEN_WINDOW: unattended tests. The window opens far off screen, never takes
+    // focus and has no taskbar button, so it does not get in the way of the person at the PC.
+    // It is still a real, visible window, so the renderer presents as usual.
+    if (std::getenv("EDEN_NX2_HIDDEN_WINDOW") != nullptr) {
+        setAttribute(Qt::WA_ShowWithoutActivating);
+#ifdef _WIN32
+        const HWND hwnd = reinterpret_cast<HWND>(winId());
+        const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex_style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) &
+                                                 ~static_cast<LONG_PTR>(WS_EX_APPWINDOW));
+        // Windows 11 slows processes whose window can't be seen (efficiency mode, coarse
+        // timers), which would skew the measurements. This process opts out of both.
+        PROCESS_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4; // 0x4: IGNORE_TIMER_RESOLUTION
+        throttling.StateMask = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                              sizeof(throttling));
+#endif
+        // The saved state may be maximized, which would ignore the position.
+        setWindowState(Qt::WindowNoState);
+        setGeometry(-24000, -24000, 1920, 1140);
+    }
+
     show();
 
 #ifdef ENABLE_UPDATE_CHECKER
@@ -528,6 +556,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // to prevent the UI from blowing up.
     UpdateUITheme();
 
+    bool launch_requested = false;
     if (QStringList args = QApplication::arguments(); args.size() >= 2) {
         QList<QByteArray> qba{};
         for (auto const& e : args)
@@ -537,6 +566,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
             args_cstr.push_back(e.data());
 
         auto const lp = Core::ParseLaunchParams(*QtCommon::system, args_cstr.size(), args_cstr.data(), nullptr);
+        launch_requested =
+            !lp.filepath.empty() || lp.launch_setup || lp.launch_qlaunch || lp.launch_hlaunch;
 
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
@@ -558,6 +589,35 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
     }
+
+    if (!launch_requested) {
+        AutoLaunchGame();
+    }
+}
+
+void MainWindow::AutoLaunchGame() {
+    if (!UISettings::values.auto_launch_enabled.GetValue()) {
+        return;
+    }
+    const QString path = QString::fromStdString(UISettings::values.auto_launch_path.GetValue());
+    if (!QFileInfo::exists(path)) {
+        LOG_WARNING(Frontend, "Auto-launch game not found: {}", path.toStdString());
+        // After the window is up: the constructor is still running here.
+        QTimer::singleShot(0, this, [this, path] {
+            QMessageBox::warning(this, tr("Game Not Found"),
+                                 tr("The game set to open at startup could not be found:\n%1\n\n"
+                                    "You can change it under Configure > System > Filesystem.")
+                                     .arg(path));
+        });
+        return;
+    }
+    LOG_INFO(Frontend, "Auto-launching {}", path.toStdString());
+    // Starts in fullscreen, as if F11 had been pressed (BootGame reads this action). Unattended
+    // test runs stay off screen.
+    if (std::getenv("EDEN_NX2_HIDDEN_WINDOW") == nullptr) {
+        ui->action_Fullscreen->setChecked(true);
+    }
+    BootGame(path, ApplicationAppletParameters());
 }
 
 MainWindow::~MainWindow() {
@@ -3228,7 +3288,8 @@ void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
 
     perf_overlay = new PerformanceOverlay(this);
-    perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+    perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked() &&
+                             !ui->action_Fullscreen->isChecked());
 
     connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
             [this]() { ui->action_Show_Performance_Overlay->setChecked(false); });
@@ -3377,6 +3438,11 @@ bool MainWindow::UsingExclusiveFullscreen() {
 }
 
 void MainWindow::ShowFullscreen() {
+    // Only the game on screen. The overlay's shortcut still brings it back.
+    if (perf_overlay) {
+        perf_overlay->hide();
+    }
+
     const auto show_fullscreen = [this](QWidget* window) {
         if (UsingExclusiveFullscreen()) {
             window->showFullScreen();
@@ -3430,6 +3496,10 @@ void MainWindow::HideFullscreen() {
             render_window->raise();
             render_window->show();
         }
+    }
+
+    if (perf_overlay) {
+        perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
     }
 }
 

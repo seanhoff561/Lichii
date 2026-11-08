@@ -139,6 +139,28 @@ public:
         SignalFence(std::move(func));
     }
 
+    /// Waits for what fences deliver: query results queued so far are in guest memory on return.
+    /// WaitPendingFences can't promise that: its wait ends at SignalFence without the fence delay.
+    void WaitForOperations() {
+        if constexpr (can_async_check) {
+            std::mutex wait_mutex;
+            std::condition_variable wait_cv;
+            bool wait_finished = false;
+            SyncOperation([&] {
+                std::scoped_lock lk(wait_mutex);
+                wait_finished = true;
+                wait_cv.notify_all();
+            });
+            SignalReference();
+            SubmitDeferredWork();
+            std::unique_lock lk(wait_mutex);
+            wait_cv.wait(lk, [&wait_finished] { return wait_finished; });
+        } else {
+            SignalReference();
+            TryReleasePendingFences<true>();
+        }
+    }
+
     void WaitPendingFences([[maybe_unused]] bool force) {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();

@@ -120,4 +120,8 @@ void SetCurrentThreadToAllCores();
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
+/// When the running frame started (steady clock, ns). EDEN_NX2_SAMPLE_SPIKES=<ms>: the sampling
+/// profiler takes samples only once a frame has run that long.
+inline std::atomic<u64> g_nx2_frame_start_ns{};
+
 } // namespace Common

@@ -35,6 +35,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 
 #if defined(__clang__) && defined(NDEBUG)
 #define LAMBDA_FORCEINLINE __attribute__((always_inline))
@@ -428,7 +429,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
+                                                       desc.indirect_offset, IsMeshPipeline());
                 ++ssbo_index;
             }
         }
@@ -753,10 +754,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
             build->Wait(!worker_only_build);
-            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now() - begin)
-                                       .count(),
-                                   std::memory_order::relaxed);
+            const auto held = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count();
+            hold_time_ns.fetch_add(held, std::memory_order::relaxed);
+            VideoCommon::Nx2Spike::Add(VideoCommon::Nx2Spike::Counter::HoldNs, held);
         });
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
@@ -1065,7 +1067,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .depthTestEnable = dynamic.depth_test_enable,
         .depthWriteEnable = dynamic.depth_write_enable,
         .depthCompareOp = dynamic.depth_test_enable
-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              ? MaxwellToVK::DepthTestOp(dynamic.DepthTestFunc())
                               : VK_COMPARE_OP_ALWAYS,
         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
         .stencilTestEnable = dynamic.stencil_enable,

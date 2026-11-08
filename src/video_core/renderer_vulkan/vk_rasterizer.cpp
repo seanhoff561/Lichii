@@ -52,6 +52,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/nx2_frame_trace.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -378,6 +379,38 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
     return true;
 }
 
+namespace {
+// EDEN_NX2_MESH_TRACE=<seconds>: from that many seconds after the first draw, log the next 400
+// task/mesh draws (target, depth state, pipeline state) to find ones that put nothing on screen.
+bool MeshTraceActive() {
+    static const double start = [] {
+        const char* const value = std::getenv("EDEN_NX2_MESH_TRACE");
+        return value != nullptr ? std::strtod(value, nullptr) : -1.0;
+    }();
+    if (start < 0.0) {
+        return false;
+    }
+    static const auto first = std::chrono::steady_clock::now();
+    static u32 logged{};
+    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - first).count() < start) {
+        return false;
+    }
+    return logged++ < 400;
+}
+
+void MeshTraceLog(const Tegra::Engines::Maxwell3D::Regs& r, std::pair<bool, bool> pipeline,
+                  const char* what, u32 groups, Tegra::MemoryManager* gpu_memory) {
+    const auto zeta_device = gpu_memory->GpuToCpuAddress(r.zeta.Address());
+    LOG_INFO(Render_Vulkan,
+             "mesh trace {} groups={} rt0={:#x} fmt={:#x} zeta={:#x} ztest={} zwrite={} zfunc={:#x} "
+             "mask={:#x} built={} failed={} zfmt={:#x} zdev={:#x}",
+             what, groups, r.rt[0].Address(), static_cast<u32>(r.rt[0].format), r.zeta.Address(),
+             r.depth_test_enable, r.depth_write_enabled, static_cast<u32>(r.depth_test_func),
+             r.color_mask[0].raw, pipeline.first, pipeline.second, static_cast<u32>(r.zeta.format),
+             zeta_device.value_or(0));
+}
+} // Anonymous namespace
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
 
@@ -464,7 +497,42 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
             }
         }
     }
+    if (mesh_draw) {
+        mesh_trace_pipeline = {pipeline->IsBuilt(), pipeline->Failed()};
+    }
+    if (maxwell3d->regs.zeta_size.width >= 2000 && VideoCommon::Nx2FrameTraceActive()) {
+        const auto& r = maxwell3d->regs;
+        const auto& vp = r.viewport_transform[0];
+        LOG_INFO(Render_Vulkan,
+                 "ftrace draw mesh={} zeta={:#x} zt={} zw={} zf={:#x} rt0={:#x} mask={:#x} vpz={}/{} "
+                 "dmode={} poff={} bias={}/{} clip={:#x} built={}",
+                 mesh_draw, r.zeta.Address(), r.depth_test_enable, r.depth_write_enabled,
+                 static_cast<u32>(r.depth_test_func), r.rt[0].Address(), r.color_mask[0].raw,
+                 vp.scale_z, vp.translate_z, static_cast<u32>(r.depth_mode),
+                 r.polygon_offset_fill_enable, r.depth_bias, r.slope_scale_depth_bias,
+                 (r.viewport_clip_control.depth_0_to_1.Value() | (static_cast<u32>(r.viewport_clip_control.geometry_clip.Value()) << 4) | (r.viewport_clip_control.pixel_min_z.Value() << 8) | (r.viewport_clip_control.pixel_max_z.Value() << 9)), pipeline->IsBuilt());
+        if (mesh_draw) {
+            const auto& h = pipeline->ShaderHashes();
+            LOG_INFO(Render_Vulkan, "ftrace mesh hashes {:x} {:x} {:x} {:x} {:x} {:x} fragdepth={}",
+                     h[0], h[1], h[2], h[3], h[4], h[5], pipeline->StageInfo(4).stores_frag_depth);
+        }
+    }
+    if (!mesh_draw && maxwell3d->regs.zeta_enable && std::getenv("EDEN_NX2_MESH_TRACE") != nullptr) {
+        const auto& r = maxwell3d->regs;
+        static std::set<std::tuple<GPUVAddr, u32, u32, GPUVAddr>> seen;
+        if (seen.size() < 200 &&
+            seen.emplace(r.zeta.Address(), static_cast<u32>(r.depth_test_func),
+                         r.depth_write_enabled, r.rt[0].Address()).second) {
+            LOG_INFO(Render_Vulkan, "depth trace draw zeta={:#x} zdev={:#x} zfmt={:#x} ztest={} zwrite={} zfunc={:#x} rt0={:#x} mask={:#x}",
+                     r.zeta.Address(), gpu_memory->GpuToCpuAddress(r.zeta.Address()).value_or(0), static_cast<u32>(r.zeta.format), r.depth_test_enable,
+                     r.depth_write_enabled, static_cast<u32>(r.depth_test_func), r.rt[0].Address(),
+                     r.color_mask[0].raw);
+        }
+    }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
+        if (mesh_draw && MeshTraceActive()) {
+            MeshTraceLog(maxwell3d->regs, mesh_trace_pipeline, "configure-failed", 0, gpu_memory);
+        }
         report_failure("configure failed");
         TraceRenderState(is_indexed, "configure-failed", nullptr);
         return;
@@ -799,8 +867,45 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
-            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            // A task/mesh draw that tests depth EQUAL against an earlier depth-only pass of the same
+            // geometry: Ocarina draws far cliffs that way, and after translation the two programs'
+            // depths differ by a hair for distant geometry, so the colour pass never drew them
+            // (flat blue walls). Test LESS_OR_EQUAL with a small pull toward the camera instead;
+            // the next draw restores the state. EDEN_NX2_MESH_EQUAL_BIAS=<constant>,<slope>
+            // (default off; the real cause was the 8 MiB native storage buffer cap).
+            static const std::pair<float, float> equal_bias = [] {
+                const char* const value = std::getenv("EDEN_NX2_MESH_EQUAL_BIAS");
+                if (value == nullptr) {
+                    return std::pair{0.0f, 0.0f};
+                }
+                char* end = nullptr;
+                const float constant = std::strtof(value, &end);
+                const float slope = (end != nullptr && *end == ',') ? std::strtof(end + 1, nullptr) : 0.0f;
+                return std::pair{constant, slope};
+            }();
+            const auto& r = maxwell3d->regs;
+            if ((equal_bias.first != 0.0f || equal_bias.second != 0.0f) && r.depth_test_enable &&
+                !r.depth_write_enabled &&
+                MaxwellToVK::ComparisonOp(r.depth_test_func) == VK_COMPARE_OP_EQUAL) {
+                scheduler.Record([bias = equal_bias](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.SetDepthCompareOpEXT(VK_COMPARE_OP_LESS_OR_EQUAL);
+                    cmdbuf.SetDepthBiasEnableEXT(true);
+                    cmdbuf.SetDepthBias(bias.first, 0.0f, bias.second);
+                });
+                auto& flags = maxwell3d->dirty.flags;
+                flags[Dirty::DepthCompareOp] = true;
+                flags[Dirty::DepthBias] = true;
+                flags[Dirty::DepthBiasEnable] = true;
+            }
+            const bool traced = MeshTraceActive();
+            if (traced) {
+                MeshTraceLog(maxwell3d->regs, mesh_trace_pipeline, "draw", draw_params.num_vertices, gpu_memory);
+            }
+            scheduler.Record([this, traced, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    if (traced) {
+                        LOG_INFO(Render_Vulkan, "mesh trace draw dropped: pipeline missing");
+                    }
                     return;
                 }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -1143,6 +1248,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
+    if (maxwell3d->regs.zeta_size.width >= 2000 && VideoCommon::Nx2FrameTraceActive()) {
+        LOG_INFO(Render_Vulkan, "ftrace clear zeta={:#x} rt0={:#x} surface={:#x} depth={}",
+                 maxwell3d->regs.zeta.Address(), maxwell3d->regs.rt[0].Address(),
+                 maxwell3d->regs.clear_surface.raw, maxwell3d->regs.clear_depth);
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -1441,6 +1551,27 @@ void RasterizerVulkan::DispatchCompute() {
             });
         });
         SubmitNx2ListCopies();
+        return;
+    }
+    // EDEN_NX2_SKIP_CS=<hash>,<hash>,...: leave out those compute shaders' dispatches (tests
+    // only: the output is wrong, used to measure what they cost).
+    static const std::vector<u64> skipped_compute = [] {
+        std::vector<u64> hashes;
+        if (const char* value = std::getenv("EDEN_NX2_SKIP_CS")) {
+            for (const char* cursor = value; *cursor;) {
+                char* end = nullptr;
+                const u64 hash = std::strtoull(cursor, &end, 16);
+                if (end == cursor) {
+                    break;
+                }
+                hashes.push_back(hash);
+                cursor = *end == ',' ? end + 1 : end;
+            }
+        }
+        return hashes;
+    }();
+    if (!skipped_compute.empty() &&
+        std::ranges::find(skipped_compute, pipeline->ShaderHash()) != skipped_compute.end()) {
         return;
     }
     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
@@ -1756,6 +1887,10 @@ void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
 }
 
+void RasterizerVulkan::WaitForQueryResults() {
+    fence_manager.WaitForOperations();
+}
+
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
     if (Settings::IsGPUHighPart(Settings::GpuHighPart::RegionFlush)) {
@@ -1957,6 +2092,15 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
         scheduler.RequestRenderpass(framebuffer);
     }
 }
+
+#ifdef EGLANTINE_STREAMLINE
+void RasterizerVulkan::TagFrameGenInputs() {
+    std::scoped_lock lock{texture_cache.mutex};
+    if (ImageView* const depth = texture_cache.TakeFrameDepth()) {
+        texture_cache_runtime.TagFrameGenInputs(*depth);
+    }
+}
+#endif
 
 void RasterizerVulkan::TickFrame() {
     Settings::PollGPUHighParts();
@@ -2859,9 +3003,6 @@ void RasterizerVulkan::UpdateLineRasterizationMode(Tegra::Engines::Maxwell3D::Re
 }
 
 void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchDepthBiasEnable()) {
-        return;
-    }
     constexpr size_t POINT = 0;
     constexpr size_t LINE = 1;
     constexpr size_t POLYGON = 2;
@@ -2887,8 +3028,20 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
         regs.polygon_offset_line_enable,
         regs.polygon_offset_fill_enable,
     };
+    // Which enable applies follows the primitive drawn: a task/mesh draw rasterizes the mesh
+    // program's triangles, and its draw topology register is whatever an earlier draw left (often
+    // points or lines, whose offset enables can be on), so it takes the fill enable. The class is
+    // checked on every draw: the registers' dirty flag misses topology and mesh/vertex changes, and
+    // Ocarina's mesh-drawn cliffs then got a depth bias in the depth pre-pass but not in the color
+    // pass, failing its depth EQUAL test (flat blue walls in Gerudo Valley).
     const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    const size_t bias_class = mesh_draw ? POLYGON : POLYGON_OFFSET_ENABLE_LUT[topology_index];
+    const bool dirty = state_tracker.TouchDepthBiasEnable();
+    if (!dirty && bias_class == depth_bias_class) {
+        return;
+    }
+    depth_bias_class = bias_class;
+    const u32 enable = enabled_lut[bias_class];
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 
@@ -2957,12 +3110,21 @@ void RasterizerVulkan::UpdateAlphaToOneEnable(Tegra::Engines::Maxwell3D::Regs& r
 }
 
 void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchDepthCompareOp()) {
+    // EDEN_NX2_MESH_DEPTH=always|le|ge: replace the depth test of task/mesh draws only (debug aid).
+    static const char* const mesh_depth = std::getenv("EDEN_NX2_MESH_DEPTH");
+    const bool dirty = state_tracker.TouchDepthCompareOp();
+    if (!dirty && (mesh_depth == nullptr || mesh_draw == depth_compare_mesh)) {
         return;
     }
-    scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
-    });
+    depth_compare_mesh = mesh_draw;
+    VkCompareOp op = MaxwellToVK::DepthTestOp(regs.depth_test_func);
+    if (mesh_depth != nullptr && mesh_draw) {
+        const std::string_view name{mesh_depth};
+        op = name == "le" ? VK_COMPARE_OP_LESS_OR_EQUAL
+             : name == "ge" ? VK_COMPARE_OP_GREATER_OR_EQUAL
+                            : VK_COMPARE_OP_ALWAYS;
+    }
+    scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthCompareOpEXT(op); });
 }
 
 void RasterizerVulkan::UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs) {

@@ -56,6 +56,10 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison);
 
+/// Depth test compare op. EDEN_NX2_DEPTH_EQUAL=le|ge|always replaces EQUAL (a pass drawn only
+/// where an earlier depth pass left the same depth) for tests; the first EQUAL is logged.
+VkCompareOp DepthTestOp(Maxwell::ComparisonOp comparison);
+
 VkIndexType IndexFormat(Maxwell::IndexFormat index_format);
 
 VkStencilOp StencilOp(Maxwell::StencilOp::Op stencil_op);

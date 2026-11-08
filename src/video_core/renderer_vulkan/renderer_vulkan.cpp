@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
 #endif
+#include "video_core/nx2_spike.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_blit_screen.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -149,6 +151,10 @@ try
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))
+#ifdef EGLANTINE_STREAMLINE
+    , streamline_surface(Streamline::RecreateSurface(instance, surface,
+                                                     render_window.GetWindowInfo().render_surface))
+#endif
     , memory_allocator(device)
     , state_tracker()
     , scheduler(device, state_tracker)
@@ -209,6 +215,7 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    VideoCommon::Nx2Spike::Frame();
     const bool trace = Common::DkbFrameTrace::Enabled();
     const auto entered = trace ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -229,6 +236,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
+#ifdef EGLANTINE_STREAMLINE
+    if (Streamline::IsFrameGenActive()) {
+        rasterizer.TagFrameGenInputs();
+    }
+#endif
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                                render_window.GetFramebufferLayout(),
@@ -400,6 +412,17 @@ void RendererVulkan::RenderAppletCaptureLayer(
 
     if (capture_layers.empty())
         return;
+
+    // The capture is only read when an applet opens, so a recent one will do: drawing it every
+    // frame took 3% of the slowest frames.
+    static const u32 capture_every = [] {
+        const char* const every = std::getenv("EDEN_NX2_APPLET_CAPTURE_EVERY");
+        return every ? static_cast<u32>((std::max)(std::atoi(every), 1)) : 30U;
+    }();
+    if (applet_frame.image && ++applet_capture_age < capture_every) {
+        return;
+    }
+    applet_capture_age = 0;
 
     if (!applet_frame.image) {
         applet_frame.image = CreateWrappedImage(memory_allocator, CaptureImageSize, CaptureFormat);

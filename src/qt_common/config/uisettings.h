@@ -140,6 +140,14 @@ struct Values {
 
     Setting<bool> check_for_updates{linkage, true, "check_for_updates", Category::UiGeneral};
 
+    // Game opened when the app starts without one on the command line.
+    Setting<bool> auto_launch_enabled{linkage, true, "auto_launch_enabled", Category::Paths};
+    Setting<std::string> auto_launch_path{
+        linkage,
+        std::string("C:/oot-recomp/The Legend of Zelda Ocarina of Time "
+                    "[0400486024dec000][v131072].nup"),
+        "auto_launch_path", Category::Paths};
+
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
 #ifndef _MSC_VER

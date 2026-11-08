@@ -42,7 +42,7 @@ constexpr u32 NopInstruction = 0xD503201F;
 constexpr size_t DynamicCallOffset = sizeof(Loader::NSOHeader) + 0x6E6CC4;
 constexpr size_t DynamicRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46200;
 constexpr size_t DynamicStateOffset = sizeof(Loader::NSOHeader) + 0x4E9FE00;
-constexpr size_t DynamicRoutineSize = 120;
+constexpr size_t DynamicRoutineSize = 160;
 constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 
@@ -227,7 +227,7 @@ namespace {
 
 std::vector<u8> MakeDynamicMain() {
     auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
-    nso.resize(DynamicStateOffset + 16);
+    nso.resize(DynamicStateOffset + 24);
     Loader::NSOHeader header;
     std::memcpy(&header, nso.data(), sizeof(header));
     header.segments[0].size = 63201744;
@@ -259,13 +259,15 @@ TEST_CASE("Built-in Dynamic FPS defaults on and can be disabled in Add-Ons", "[p
     auto patched = manager.PatchNSO(nso, "main");
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0x1E201828);
-    REQUIRE(WordAt(patched, DynamicRoutineOffset + 116) == 0x3F83D70A);
+    REQUIRE(WordAt(patched, DynamicRoutineOffset + 152) == 0x3F83D70A);
+    REQUIRE(WordAt(patched, DynamicRoutineOffset + 156) == 0x3F7851EC);
     REQUIRE(
         Common::HexToString(std::span{patched}.subspan(DynamicRoutineOffset, DynamicRoutineSize)) ==
-        "2818201ECA9200B04A0138912BE03BD54C0140F94B0100F9CC0200B46B010CCB0DE03BD5"
-        "8E0280D2AE09CE9A7F010EEBCB818B9A4C0540F94C0000B5EC030BAA6E010CCB8C0D8E8B"
-        "4C0500F98201239EA301239E4218231E4208211EC300001C0309231E4020231E4D000054"
-        "4840201EC0035FD60AD7833F");
+        "2818201ECA9200B04A013891481100BD2BE03BD54C0140F94B0100F9CC0300B46B010CCB"
+        "0DE03BD58E0280D2AE09CE9A7F010EEBCB818B9A4C0540F94C0000B5EC030BAA8E054C8B"
+        "7F010EEBCB818B9A6E010CCB8C0D8E8B4C0500F98201239EA301239E4218231E4208211E"
+        "6301001C0309231E4020231EAC0000540301001C0309231E4020231E4A0000544840201E"
+        "481500BDC0035FD60AD7833FEC51783F");
     REQUIRE(WordAt(patched) == BranchInstruction);
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{DynamicFps}};
     REQUIRE_FALSE(enabled());
@@ -308,7 +310,7 @@ TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transact
         nso.resize(DynamicRoutineOffset + DynamicRoutineSize - 1);
     }
     SECTION("Incomplete timer state") {
-        nso.resize(DynamicStateOffset + 15);
+        nso.resize(DynamicStateOffset + 23);
     }
     SECTION("Timer state outside BSS") {
         Loader::NSOHeader header;
@@ -323,7 +325,7 @@ TEST_CASE("Built-in Dynamic FPS rejects mismatched or truncated modules transact
         nso[DynamicRoutineOffset + DynamicRoutineSize - 1] = 1;
     }
     SECTION("Nonzero timer state") {
-        nso[DynamicStateOffset + 15] = 1;
+        nso[DynamicStateOffset + 23] = 1;
     }
     SECTION("Code cave outside executable padding") {
         Loader::NSOHeader header;

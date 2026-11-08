@@ -106,6 +106,12 @@ struct Profile {
     bool has_broken_spirv_subgroup_shuffle{};
     u32 max_subgroup_size{};
 
+    /// HMMA runs on the host tensor cores through SPV_KHR_cooperative_matrix: fp16 16x8x16 and
+    /// 16x8x8 with an fp16 accumulator, subgroup scope, 32 invocations per subgroup.
+    bool support_cooperative_matrix_f16_16816{};
+    bool support_cooperative_matrix_f16_1688{};
+    u32 max_compute_shared_memory{};
+
     u32 gl_max_compute_smem_size{};
 
     /// Maxwell and earlier nVidia architectures have broken robust support

@@ -22,6 +22,9 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "vulkan/vulkan_core.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 
 namespace Vulkan {
 
@@ -43,6 +46,14 @@ VkSurfaceFormatKHR ChooseSwapSurfaceFormat(vk::Span<VkSurfaceFormatKHR> formats)
 
 static VkPresentModeKHR ChooseSwapPresentMode(bool has_imm, bool has_mailbox,
                                               bool has_fifo_relaxed) {
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS frame generation paces its own presents, and on Vulkan only without vsync.
+    if (Streamline::IsFrameGenActive()) {
+        return has_imm      ? VK_PRESENT_MODE_IMMEDIATE_KHR
+               : has_mailbox ? VK_PRESENT_MODE_MAILBOX_KHR
+                             : VK_PRESENT_MODE_FIFO_KHR;
+    }
+#endif
     // Mailbox doesn't lock the application like FIFO (vsync)
     // FIFO present mode locks the framerate to the monitor's refresh rate
     Settings::VSyncMode setting = [has_imm, has_mailbox]() {
@@ -293,6 +304,15 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
     } else {
         requested_image_count = (std::max)(requested_image_count, 3U);
     }
+    VkImageUsageFlags image_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS frame generation reads the finished frame from the swapchain image.
+    if (Streamline::IsFrameGenActive()) {
+        image_usage |= capabilities.supportedUsageFlags &
+                       (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    }
+#endif
     VkSwapchainCreateInfoKHR swapchain_ci{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .pNext = nullptr,
@@ -303,7 +323,7 @@ void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
         .imageColorSpace = surface_format.colorSpace,
         .imageExtent = {},
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageUsage = image_usage,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,

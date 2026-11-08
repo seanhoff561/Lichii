@@ -10,11 +10,15 @@
 #ifdef HAS_LSFG
 #include "video_core/renderer_vulkan/present/lsfg_common.h"
 #endif
+#include "video_core/nx2_spike.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -170,6 +174,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
+    VideoCommon::Nx2Spike::Timer spike_timer{VideoCommon::Nx2Spike::Counter::AcquireFrameNs};
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -187,14 +192,25 @@ Frame* PresentManager::GetRenderFrame() {
 }
 
 void PresentManager::Present(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    const auto finish_frame = [frame] {
+        const Streamline::PresentedFrame finished = Streamline::FinishFrame();
+        frame->frame_gen_token = finished.token;
+        frame->frame_gen_generate = finished.generate;
+    };
+#else
+    const auto finish_frame = [] {};
+#endif
     if (use_present_thread) {
-        scheduler.Record([this, frame](vk::CommandBuffer) {
+        scheduler.Record([this, frame, finish_frame](vk::CommandBuffer) {
+            finish_frame();
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();
         });
     } else {
         scheduler.WaitWorker();
+        finish_frame();
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -356,6 +372,9 @@ void PresentManager::PresentThread(std::stop_token token) {
 }
 
 void PresentManager::RecreateSwapchain(Frame* frame) {
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::PauseFrameGen();
+#endif
     swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
     SetImageCount();
 }
@@ -397,6 +416,7 @@ void PresentManager::DiscardFrame(Frame* frame) {
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
+    VideoCommon::Nx2Spike::Timer spike_timer{VideoCommon::Nx2Spike::Counter::PresentNs};
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
@@ -588,7 +608,17 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
+#ifdef EGLANTINE_STREAMLINE
+    const Streamline::PresentedFrame presented{
+        .token = frame->frame_gen_token,
+        .generate = frame->frame_gen_generate,
+    };
+    Streamline::PresentStart(presented);
+#endif
     swapchain.Present(render_semaphore);
+#ifdef EGLANTINE_STREAMLINE
+    Streamline::PresentEnd(presented);
+#endif
 }
 
 } // namespace Vulkan

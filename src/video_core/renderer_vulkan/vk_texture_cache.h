@@ -267,6 +267,9 @@ public:
                          std::array<f32, 2> motion_scale, bool reset);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    std::unique_ptr<StreamlineFrameTagger> frame_gen_tagger;
+    /// Tags a frame without a DLSS evaluation for frame generation.
+    void TagFrameGenInputs(ImageView& depth);
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next

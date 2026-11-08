@@ -1435,8 +1435,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
-                    // fence: write them out, or occlusion predicates read stale values. The split only
-                    // runs with immediate payload writes, and the query cache belongs to its back.
+                    // fence: write them out, or occlusion predicates read stale values. With the split
+                    // the query cache belongs to its back: Maxwell3D::FrontDmaRead does this there.
                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
                                              VideoCommon::GpuSplit::OnBackThread();
                     if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&

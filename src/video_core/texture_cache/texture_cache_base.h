@@ -142,7 +142,6 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
-    std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
@@ -306,6 +305,10 @@ public:
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src);
 
+    /// The frame's main depth buffer: the one most draws with a colour target used since the last
+    /// call. Null when none qualified (a menu or a video drawn without depth).
+    [[nodiscard]] ImageView* TakeFrameDepth();
+
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
         const Tegra::FramebufferConfig& config, DAddr cpu_addr);
@@ -401,6 +404,15 @@ private:
     /// Upload data from guest to an image
     template <typename StagingBuffer>
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
+
+    /// Copies guest memory without flushing, on several threads when it is large.
+    void ReadGuestParallel(GPUVAddr gpu_addr, u8* dest, size_t size);
+
+    /// ReadBlock with CacheType::NoTextureCache semantics: flushes first, then copies in parallel.
+    void ReadGuestForUpload(GPUVAddr gpu_addr, u8* dest, size_t size);
+
+    /// The swizzled bytes of a texture: in place when contiguous, else in swizzle_data_buffer.
+    [[nodiscard]] std::span<const u8> GuestTextureSpan(GPUVAddr gpu_addr, size_t size);
 
     /// Create a new image view from a guest descriptor
     [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
@@ -532,6 +544,14 @@ private:
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
     RenderTargets render_targets;
+
+    struct FrameDepth {
+        ImageViewId id{};
+        u32 draws{};
+    };
+    void NoteFrameDepth(ImageViewId depth_buffer_id);
+    std::array<FrameDepth, 12> frame_depths{}; ///< Depth buffers drawn to, see TakeFrameDepth
+    FrameDepth* frame_depth_current{}; ///< The one bound now, when it has a colour target
     u64 render_targets_serial = 0;
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
@@ -637,6 +657,9 @@ private:
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
+    /// Helps copy big textures out of guest memory, the longest part of a slow frame.
+    Common::ThreadWorker guest_read_workers{3, "GuestRead", {},
+                                            Common::ThreadPlacement::Efficiency};
     std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
     /// Guest memory images were uploaded from since the last cold hint (device address, size).
     std::vector<std::pair<DAddr, u64>> uploaded_ranges;

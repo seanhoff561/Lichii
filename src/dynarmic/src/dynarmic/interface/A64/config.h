@@ -89,6 +89,9 @@ struct UserCallbacks {
 
     // All reads through this callback are 4-byte aligned.
     // Memory must be interpreted as little endian.
+    /// A block was compiled while running (not by Jit::Precompile).
+    virtual void BlockCompiled(std::uint64_t /*descriptor*/) {}
+
     virtual std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) {
         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
     }

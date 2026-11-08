@@ -323,6 +323,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
     X(vkGetPhysicalDeviceToolProperties);
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetSwapchainImagesKHR);
     X(vkQueuePresentKHR);
 
@@ -991,6 +992,27 @@ std::vector<VkQueueFamilyProperties> PhysicalDevice::GetQueueFamilyProperties() 
     dld->vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &num, nullptr);
     std::vector<VkQueueFamilyProperties> properties(num);
     dld->vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &num, properties.data());
+    return properties;
+}
+
+std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatrixPropertiesKHR()
+    const {
+    if (!dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num, nullptr) !=
+        VK_SUCCESS) {
+        return {};
+    }
+    std::vector<VkCooperativeMatrixPropertiesKHR> properties(
+        num, VkCooperativeMatrixPropertiesKHR{
+                 .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+    if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num,
+                                                               properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    properties.resize(num);
     return properties;
 }
 

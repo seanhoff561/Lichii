@@ -38,6 +38,8 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     bool storage_capable{};
+    void* frame_gen_token{};   ///< Streamline's token for this frame, with frame generation
+    bool frame_gen_generate{}; ///< Frame generation has this frame's inputs
 };
 
 class PresentManager {

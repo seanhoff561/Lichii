@@ -91,6 +91,9 @@ public:
     /// Release all pending fences.
     virtual void ReleaseFences(bool force = true) = 0;
 
+    /// Waits until the results of the queries sent so far are in guest memory.
+    virtual void WaitForQueryResults() {}
+
     /// Notify rasterizer that all caches should be flushed to Switch memory
     virtual void FlushAll() = 0;
 

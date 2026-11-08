@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <filesystem>
+#include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QProgressDialog>
 #include "common/fs/fs.h"
@@ -33,6 +35,17 @@ ConfigureFilesystem::ConfigureFilesystem(QWidget* parent)
             [this] { SetDirectory(DirectoryTarget::Dump, ui->dump_path_edit); });
     connect(ui->load_path_button, &QToolButton::pressed, this,
             [this] { SetDirectory(DirectoryTarget::Load, ui->load_path_edit); });
+
+    connect(ui->auto_launch_path_button, &QToolButton::pressed, this, [this] {
+        const QString path = QFileDialog::getOpenFileName(
+            this, tr("Select Startup Game..."), QFileInfo(ui->auto_launch_path_edit->text()).dir().path(),
+            tr("Switch Games (*.nup *.nsp *.xci *.nca);;All Files (*)"));
+        if (!path.isEmpty()) {
+            ui->auto_launch_path_edit->setText(path);
+        }
+    });
+    connect(ui->auto_launch_enabled, &QCheckBox::STATE_CHANGED, this,
+            &ConfigureFilesystem::UpdateEnabledControls);
 
     connect(ui->reset_game_list_cache, &QPushButton::pressed, this,
             &ConfigureFilesystem::ResetMetadata);
@@ -74,6 +87,10 @@ void ConfigureFilesystem::SetConfiguration() {
 
     ui->cache_game_list->setChecked(UISettings::values.cache_game_list.GetValue());
 
+    ui->auto_launch_enabled->setChecked(UISettings::values.auto_launch_enabled.GetValue());
+    ui->auto_launch_path_edit->setText(
+        QString::fromStdString(UISettings::values.auto_launch_path.GetValue()));
+
     UpdateEnabledControls();
 }
 
@@ -95,6 +112,14 @@ void ConfigureFilesystem::ApplyConfiguration() {
     Settings::values.dump_nso = ui->dump_nso->isChecked();
 
     UISettings::values.cache_game_list = ui->cache_game_list->isChecked();
+
+    // An empty string loads back as the default path, so an empty field turns the feature off.
+    const QString auto_launch_path = ui->auto_launch_path_edit->text().trimmed();
+    UISettings::values.auto_launch_enabled =
+        ui->auto_launch_enabled->isChecked() && !auto_launch_path.isEmpty();
+    if (!auto_launch_path.isEmpty()) {
+        UISettings::values.auto_launch_path = auto_launch_path.toStdString();
+    }
 }
 
 void ConfigureFilesystem::SetDirectory(DirectoryTarget target, QLineEdit* edit) {
@@ -270,6 +295,8 @@ void ConfigureFilesystem::ResetMetadata() {
 }
 
 void ConfigureFilesystem::UpdateEnabledControls() {
+    ui->auto_launch_path_edit->setEnabled(ui->auto_launch_enabled->isChecked());
+    ui->auto_launch_path_button->setEnabled(ui->auto_launch_enabled->isChecked());
     ui->gamecard_current_game->setEnabled(ui->gamecard_inserted->isChecked());
     ui->gamecard_path_edit->setEnabled(ui->gamecard_inserted->isChecked() &&
                                        !ui->gamecard_current_game->isChecked());

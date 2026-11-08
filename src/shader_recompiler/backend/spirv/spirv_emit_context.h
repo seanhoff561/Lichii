@@ -366,6 +366,25 @@ public:
     Id frag_depth{};
 
     std::array<Id, 2> software_matrix_functions{};
+
+    // HMMA on the host tensor cores (SPV_KHR_cooperative_matrix). Each subgroup owns 1 KiB of
+    // workgroup scratch: A at word 0 (row major), B at word 128 (column major), C and D at word
+    // 192 (row major). An HMMA writes its fragments there, then a call to cooperative_marker
+    // stands for the cooperative load, multiply-add and store that PatchCooperativeMatrix puts
+    // in its place after assembly (Sirit has no such instructions).
+    struct CooperativeSite {
+        Id call;
+        Id a, b, c; ///< Pointers to the A, B and C regions
+        bool k16;
+    };
+    std::array<bool, 2> cooperative_matrix{}; ///< [k16]: this depth runs on tensor cores
+    Id cooperative_scratch{};
+    bool cooperative_scratch_block{}; ///< The scratch is member 0 of a Block struct
+    Id cooperative_word_pointer{};    ///< Workgroup pointer to u32
+    Id subgroup_id{};
+    Id cooperative_marker{};
+    Id cooperative_f16{};
+    std::vector<CooperativeSite> cooperative_sites;
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
@@ -385,6 +404,7 @@ public:
     Id mesh_primitive_count{};
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
+    Id mesh_point_size{}; ///< PointSize written as 1.0 by point programs that write none
     MeshInfo mesh_info{};
     u32 mesh_threads{};
     u32 mesh_attribute_words{};

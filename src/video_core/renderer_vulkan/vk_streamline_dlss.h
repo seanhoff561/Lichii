@@ -77,4 +77,28 @@ private:
     std::atomic<bool> failed{};
 };
 
+/// Frame generation for games with no DLSS evaluation (Ocarina of Time has none, and draws no
+/// motion vectors): tags the frame's depth and blank motion vectors, which leaves the motion to
+/// the optical flow.
+class StreamlineFrameTagger {
+public:
+    explicit StreamlineFrameTagger(const Device& device, Scheduler& scheduler,
+                                   MemoryAllocator& memory_allocator);
+    ~StreamlineFrameTagger();
+
+    /// Depth is reversed device depth in GENERAL layout, as a game's depth buffer is between
+    /// draws. Does nothing when the frame already has a DLSS evaluation.
+    void Tag(const StreamlineDlssUpscaler::Image& depth, VkExtent2D size);
+
+private:
+    void CreateMotion(VkExtent2D size);
+
+    const Device& device;
+    Scheduler& scheduler;
+    MemoryAllocator& memory_allocator;
+    VkExtent2D extent{};
+    vk::Image motion_image;
+    vk::ImageView motion_view;
+};
+
 } // namespace Vulkan

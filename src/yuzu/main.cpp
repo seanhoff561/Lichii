@@ -33,6 +33,7 @@
 
 #include "main_window.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 
 #ifdef _WIN32
 #include <QScreen>
@@ -165,6 +166,7 @@ static void LoadNx2Switches(const char* argv0) {
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
     VideoCommon::Nx2Profile::Reload();
+    VideoCommon::Nx2Spike::Reload();
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

@@ -1894,6 +1894,43 @@ void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkIma
 }
 
 #ifdef EGLANTINE_STREAMLINE
+namespace {
+StreamlineDlssUpscaler::Image StreamlineImage(const Device& device, ImageView& view,
+                                              VkImageView handle, VkImageAspectFlags aspect) {
+    return StreamlineDlssUpscaler::Image{
+        .view = handle,
+        .image = view.ImageHandle(),
+        .format =
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format,
+        .range{
+            .aspectMask = aspect,
+            .baseMipLevel = static_cast<u32>(view.range.base.level),
+            .levelCount = 1,
+            .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+            .layerCount = 1,
+        },
+        .barrier_aspect = ImageAspectMask(view.format),
+    };
+}
+} // Anonymous namespace
+
+void TextureCacheRuntime::TagFrameGenInputs(ImageView& depth) {
+    const Image* const image = depth.BackingImage();
+    if (!image || depth.Samples() != VK_SAMPLE_COUNT_1_BIT || depth.range.base.level != 0 ||
+        depth.range.base.layer != 0) {
+        return;
+    }
+    const VkExtent2D size = image->IsRescaled()
+        ? VkExtent2D{resolution.ScaleUp(depth.size.width), resolution.ScaleUp(depth.size.height)}
+        : VkExtent2D{depth.size.width, depth.size.height};
+    if (!frame_gen_tagger) {
+        frame_gen_tagger =
+            std::make_unique<StreamlineFrameTagger>(device, scheduler, memory_allocator);
+    }
+    frame_gen_tagger->Tag(
+        StreamlineImage(device, depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT), size);
+}
+
 bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
@@ -1924,20 +1961,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         }
     }
     const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
-        return StreamlineDlssUpscaler::Image{
-            .view = handle,
-            .image = view.ImageHandle(),
-            .format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format)
-                          .format,
-            .range{
-                .aspectMask = aspect,
-                .baseMipLevel = static_cast<u32>(view.range.base.level),
-                .levelCount = 1,
-                .baseArrayLayer = static_cast<u32>(view.range.base.layer),
-                .layerCount = 1,
-            },
-            .barrier_aspect = ImageAspectMask(view.format),
-        };
+        return StreamlineImage(device, view, handle, aspect);
     };
     const VkExtent2D extent = dst_framebuffer->RenderArea();
     bool upscaled{};

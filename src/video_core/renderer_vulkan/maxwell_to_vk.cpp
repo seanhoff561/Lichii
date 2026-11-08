@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <iterator>
+#include <string_view>
 
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -610,6 +612,23 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
 
     return device.GetSupportedFormat(format, VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
                                      FormatType::Buffer);
+}
+
+VkCompareOp DepthTestOp(Maxwell::ComparisonOp comparison) {
+    const VkCompareOp op = ComparisonOp(comparison);
+    if (op != VK_COMPARE_OP_EQUAL) {
+        return op;
+    }
+    static const VkCompareOp replacement = [] {
+        const char* const value = std::getenv("EDEN_NX2_DEPTH_EQUAL");
+        const std::string_view name = value != nullptr ? value : "";
+        LOG_INFO(Render_Vulkan, "Depth test EQUAL in use (EDEN_NX2_DEPTH_EQUAL={})", name);
+        return name == "le"       ? VK_COMPARE_OP_LESS_OR_EQUAL
+               : name == "ge"     ? VK_COMPARE_OP_GREATER_OR_EQUAL
+               : name == "always" ? VK_COMPARE_OP_ALWAYS
+                                  : VK_COMPARE_OP_EQUAL;
+    }();
+    return replacement;
 }
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {

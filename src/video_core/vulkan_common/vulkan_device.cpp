@@ -763,6 +763,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
 
+#ifdef EGLANTINE_STREAMLINE
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+        .pNext = const_cast<void*>(first_next),
+        .opticalFlow = VK_TRUE,
+    };
+    if (streamline_frame_gen && streamline_native_optical_flow) {
+        first_next = &optical_flow_features;
+    }
+#endif
+
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -770,8 +781,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
-        streamline_attached =
-            Streamline::AttachDevice(instance, physical, *logical, graphics_family, dld);
+        const Streamline::FrameGenDevice frame_gen{
+            .enabled = streamline_frame_gen,
+            .compute_family = streamline_compute_family,
+            .optical_flow_family = streamline_optical_flow_family,
+            .native_optical_flow = streamline_native_optical_flow,
+        };
+        streamline_attached = Streamline::AttachDevice(instance, physical, *logical,
+                                                       graphics_family, frame_gen, dld);
     } else if (Streamline::WantsDevice()) {
         Streamline::Stop();
     }
@@ -1169,6 +1186,31 @@ bool Device::GetSuitability(bool requires_swapchain) {
         streamline_extensions = all;
         LOG_INFO(Render_Vulkan, "NVIDIA DLSS device extensions: {} ({})",
                  all ? "enabled" : "unavailable", names.empty() ? "none" : names);
+
+        // Frame generation is on top: DLSS runs without it. Reflex takes either low latency
+        // extension, and the newer one needs present ids.
+        const std::vector<std::string> frame_gen = Streamline::FrameGenDeviceExtensions();
+        const bool frame_gen_all =
+            all && !frame_gen.empty() &&
+            std::ranges::all_of(frame_gen, [&](const std::string& name) {
+                return name == VK_NV_LOW_LATENCY_EXTENSION_NAME ||
+                       supported_extensions.contains(name);
+            });
+        std::string frame_gen_names;
+        for (const std::string& name : frame_gen) {
+            if (frame_gen_all && supported_extensions.contains(name)) {
+                loaded_extensions.insert(name);
+            }
+            frame_gen_names += (frame_gen_names.empty() ? "" : ", ") + name;
+        }
+        if (frame_gen_all && supported_extensions.contains(VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        }
+        streamline_frame_gen = frame_gen_all;
+        if (!frame_gen.empty()) {
+            LOG_INFO(Render_Vulkan, "DLSS frame generation device extensions: {} ({})",
+                     frame_gen_all ? "enabled" : "unavailable", frame_gen_names);
+        }
     }
 #endif
 
@@ -1618,6 +1660,39 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
                                        VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
 
+    // VK_KHR_cooperative_matrix: Switch 2 shaders use HMMA, the tensor core instruction. Its
+    // fp16 16x8x16 and 16x8x8 forms run on the host's tensor cores through this extension
+    // (EDEN_NX2_TENSOR=0 keeps the software version).
+    {
+        const char* const tensor_env = std::getenv("EDEN_NX2_TENSOR");
+        const bool wanted = !tensor_env || tensor_env[0] != '0';
+        if (wanted && features.cooperative_matrix.cooperativeMatrix &&
+            properties.subgroup_properties.subgroupSize == 32) {
+            for (const auto& shape : physical.GetCooperativeMatrixPropertiesKHR()) {
+                const bool f16 = shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                 shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                 shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                 shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                 shape.scope == VK_SCOPE_SUBGROUP_KHR &&
+                                 shape.saturatingAccumulation == VK_FALSE;
+                if (f16 && shape.MSize == 16 && shape.NSize == 8) {
+                    cooperative_matrix_f16_16816 |= shape.KSize == 16;
+                    cooperative_matrix_f16_1688 |= shape.KSize == 8;
+                }
+            }
+        }
+        extensions.cooperative_matrix = cooperative_matrix_f16_16816 || cooperative_matrix_f16_1688;
+        features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+        RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
+                                           features.cooperative_matrix,
+                                           VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        if (!extensions.cooperative_matrix) {
+            cooperative_matrix_f16_16816 = cooperative_matrix_f16_1688 = false;
+        }
+        LOG_INFO(Render_Vulkan, "Tensor cores for HMMA: 16x8x16 {}, 16x8x8 {}",
+                 cooperative_matrix_f16_16816, cooperative_matrix_f16_1688);
+    }
+
     // VK_KHR_workgroup_memory_explicit_layout
     extensions.workgroup_memory_explicit_layout =
         features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout &&
@@ -1702,7 +1777,56 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     if (present) {
         present_family = *present;
     }
+#ifdef EGLANTINE_STREAMLINE
+    if (streamline_frame_gen) {
+        SetupFrameGenFamilies(queue_family_properties);
+    }
+#endif
 }
+
+#ifdef EGLANTINE_STREAMLINE
+void Device::SetupFrameGenFamilies(std::span<const VkQueueFamilyProperties> families) {
+    constexpr VkQueueFlags OTHER_WORK = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+    const Streamline::FrameGenQueues wanted = Streamline::FrameGenQueuesWanted();
+    std::optional<u32> compute;
+    std::optional<u32> optical_flow;
+    for (u32 index = 0; index < static_cast<u32>(families.size()); ++index) {
+        const VkQueueFamilyProperties& family = families[index];
+        LOG_INFO(Render_Vulkan, "Queue family {}: flags {:#x}, {} queues", index, family.queueFlags,
+                 family.queueCount);
+        if (!compute && (family.queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+            !(family.queueFlags & VK_QUEUE_GRAPHICS_BIT) && family.queueCount >= wanted.compute) {
+            compute = index;
+        }
+        if (!optical_flow && (family.queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) &&
+            !(family.queueFlags & OTHER_WORK) && family.queueCount >= wanted.optical_flow) {
+            optical_flow = index;
+        }
+    }
+    if (!compute || families[graphics_family].queueCount < 1 + wanted.graphics) {
+        LOG_WARNING(Render_Vulkan, "No room for the queues of DLSS frame generation");
+        streamline_frame_gen = false;
+        return;
+    }
+    streamline_compute_family = *compute;
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+        .pNext = nullptr,
+        .opticalFlow = VK_FALSE,
+    };
+    VkPhysicalDeviceFeatures2 features_query{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &optical_flow_features,
+        .features = {},
+    };
+    physical.GetFeatures2(features_query);
+    streamline_native_optical_flow =
+        optical_flow && wanted.optical_flow > 0 && optical_flow_features.opticalFlow;
+    if (streamline_native_optical_flow) {
+        streamline_optical_flow_family = *optical_flow;
+    }
+}
+#endif
 
 bool Device::TryReserveCustomBorderColorSamplers(size_t count) const {
     const size_t limit = properties.custom_border_color.maxCustomBorderColorSamplers;
@@ -1877,6 +2001,14 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS frame generation's own queues, at the lowest priority.
+    static constexpr std::array<float, 2> GRAPHICS_PRIORITIES{QUEUE_PRIORITY, 0.0f};
+    static constexpr std::array<float, 8> FRAME_GEN_PRIORITIES{};
+    const Streamline::FrameGenQueues frame_gen = streamline_frame_gen
+                                                     ? Streamline::FrameGenQueuesWanted()
+                                                     : Streamline::FrameGenQueues{};
+#endif
     for (const u32 queue_family : unique_queue_families) {
         auto& ci = queue_cis.emplace_back(VkDeviceQueueCreateInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -1887,7 +2019,31 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             .pQueuePriorities = nullptr,
         });
         ci.pQueuePriorities = &QUEUE_PRIORITY;
+#ifdef EGLANTINE_STREAMLINE
+        if (queue_family == graphics_family && frame_gen.graphics > 0) {
+            ci.queueCount = 1 + (std::min)(frame_gen.graphics, u32{1});
+            ci.pQueuePriorities = GRAPHICS_PRIORITIES.data();
+        }
+#endif
     }
+#ifdef EGLANTINE_STREAMLINE
+    const auto add_family = [&](u32 family, u32 count) {
+        queue_cis.push_back(VkDeviceQueueCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queueFamilyIndex = family,
+            .queueCount = (std::min)(count, static_cast<u32>(FRAME_GEN_PRIORITIES.size())),
+            .pQueuePriorities = FRAME_GEN_PRIORITIES.data(),
+        });
+    };
+    if (frame_gen.compute > 0) {
+        add_family(streamline_compute_family, frame_gen.compute);
+    }
+    if (streamline_native_optical_flow) {
+        add_family(streamline_optical_flow_family, frame_gen.optical_flow);
+    }
+#endif
 
     return queue_cis;
 }

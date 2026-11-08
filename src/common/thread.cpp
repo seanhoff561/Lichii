@@ -671,8 +671,21 @@ void Run() {
     std::vector<SampledThread> threads;
     auto last_report = std::chrono::steady_clock::now();
     u64 words[StackWords];
+    const u64 spike_ns = [] {
+        const char* const text = std::getenv("EDEN_NX2_SAMPLE_SPIKES");
+        return text ? static_cast<u64>(std::atoll(text)) * 1'000'000 : u64{0};
+    }();
     for (;;) {
         Sleep(1);
+        if (spike_ns != 0) {
+            const u64 now_ns = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (now_ns - g_nx2_frame_start_ns.load(std::memory_order_relaxed) < spike_ns) {
+                continue;
+            }
+        }
         {
             std::scoped_lock lock{g_threads_mutex};
             threads = g_threads;

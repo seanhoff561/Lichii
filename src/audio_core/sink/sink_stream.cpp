@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <span>
@@ -213,6 +214,7 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
             if (!queue.TryPop(playing_buffer)) {
                 lk.unlock();
+                underrun_frames += num_frames - frames_written;
                 for (size_t i = frames_written; i < num_frames; i++) {
                     if (type == StreamType::Sysmix) {
                         std::memset(&output_buffer[i * frame_size], 0, frame_size_bytes);
@@ -243,6 +245,43 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
 
     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
 
+    // Audio that cuts out leaves no other trace: the game fed this stream too late.
+    underrun_window += num_frames;
+    if (underrun_window >= TargetSampleRate * 5) {
+        if (underrun_frames != 0) {
+            LOG_WARNING(Audio, "{}: nothing to play for {} of {} frames", name, underrun_frames,
+                        underrun_window);
+        }
+        underrun_frames = 0;
+        underrun_window = 0;
+    }
+
+    // EDEN_NX2_AUDIO_TAP=<file>: keep the mixed output as raw 16-bit audio, to look for gaps.
+    if (static std::FILE* const tap = [] {
+            const char* const path = std::getenv("EDEN_NX2_AUDIO_TAP");
+            return path ? std::fopen(path, "wb") : nullptr;
+        }();
+        tap && type == StreamType::Render) {
+        std::fwrite(output_buffer.data(), sizeof(s16), num_frames * frame_size, tap);
+        std::fflush(tap);
+        // And log when it goes silent, to line that up with the rest of the log.
+        static u64 silent_frames = 0;
+        const bool silent = std::all_of(output_buffer.begin(),
+                                        output_buffer.begin() + num_frames * frame_size,
+                                        [](s16 sample) { return sample == 0; });
+        if (silent) {
+            silent_frames += num_frames;
+            if (silent_frames >= TargetSampleRate / 20 && silent_frames < TargetSampleRate / 20 + num_frames) {
+                LOG_INFO(Audio, "tap: output went silent");
+            }
+        } else {
+            if (silent_frames >= TargetSampleRate / 20) {
+                LOG_INFO(Audio, "tap: output back after {} ms", silent_frames * 1000 / TargetSampleRate);
+            }
+            silent_frames = 0;
+        }
+    }
+
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;
         meter || type == StreamType::Sysmix) {
@@ -255,6 +294,12 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             level_frames = 0;
             level_peak = 0;
         }
+    }
+
+    // EDEN_NX2_MUTE: silence the speakers for unattended tests. It runs after the tap and the
+    // meter, so both still see the real output.
+    if (static const bool mute = std::getenv("EDEN_NX2_MUTE") != nullptr; mute) {
+        std::memset(output_buffer.data(), 0, num_frames * frame_size * sizeof(s16));
     }
 
     {

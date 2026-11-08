@@ -279,12 +279,16 @@ void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
 
 void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     constexpr size_t deletions_per_tick = 16;
+    // Texture uploads come in bursts: an upload buffer stays a few seconds after its last use,
+    // because allocating another in the next burst costs more than keeping this one.
+    constexpr u64 UploadKeepTicks = 3000;
+    const u64 keep = &cache == &GetCache(MemoryUsage::Upload) ? UploadKeepTicks : 0;
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
 
-    const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
+    const auto is_deletable = [this, keep](const StagingBuffer& entry) {
+        return !entry.deferred && scheduler.IsFree(entry.tick + keep);
     };
     const size_t begin_offset = staging.delete_index;
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);

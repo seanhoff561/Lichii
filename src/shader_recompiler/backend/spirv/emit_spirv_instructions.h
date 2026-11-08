@@ -644,5 +644,7 @@ Id EmitDPdyCoarse(EmitContext& ctx, Id op_a);
 
 Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program);
+void DefineCooperativeMatrix(EmitContext& ctx, const IR::Program& program);
+void PatchCooperativeMatrix(std::vector<u32>& code, const EmitContext& ctx);
 
 } // namespace Shader::Backend::SPIRV

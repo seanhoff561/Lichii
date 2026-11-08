@@ -127,6 +127,7 @@ public:
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;
+    void WaitForQueryResults() override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
@@ -134,6 +135,10 @@ public:
     void TiledCacheBarrier() override;
     void FlushCommands() override;
     void TickFrame() override;
+#ifdef EGLANTINE_STREAMLINE
+    /// Hands this frame's depth to DLSS frame generation, for games without a DLSS evaluation.
+    void TagFrameGenInputs();
+#endif
     bool AccelerateConditionalRendering() override;
     bool HasDrawTransformFeedback() override;
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
@@ -278,6 +283,9 @@ private:
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+    size_t depth_bias_class{~size_t{0}}; ///< point/line/fill enable last used for depth bias
+    bool depth_compare_mesh{}; ///< mesh_draw when the depth compare op was last set
+    std::pair<bool, bool> mesh_trace_pipeline{}; ///< built, failed (EDEN_NX2_MESH_TRACE)
 
     struct IndirectTrace {
         vk::Buffer readback;

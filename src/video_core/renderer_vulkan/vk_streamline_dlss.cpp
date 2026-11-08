@@ -20,6 +20,13 @@ namespace Vulkan {
 namespace {
 
 constexpr VkFormat OUTPUT_FORMAT = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkImageSubresourceRange COLOR_RANGE{
+    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    .baseMipLevel = 0,
+    .levelCount = 1,
+    .baseArrayLayer = 0,
+    .layerCount = 1,
+};
 // Streamline clears the output before DLSS writes it.
 constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -70,6 +77,32 @@ sl::float4x4 Identity() {
     matrix.setRow(2, {0.0f, 0.0f, 1.0f, 0.0f});
     matrix.setRow(3, {0.0f, 0.0f, 0.0f, 1.0f});
     return matrix;
+}
+
+// Everything but the jitter, motion scale and reset, which vary. DLSS super resolution only reads
+// the jitter, motion and depth conventions. Frame generation has no camera to read: motion vectors
+// include it.
+sl::Constants BaseConstants(f32 width, f32 height) {
+    sl::Constants constants{};
+    constants.cameraViewToClip = Identity();
+    constants.clipToCameraView = Identity();
+    constants.clipToLensClip = Identity();
+    constants.clipToPrevClip = Identity();
+    constants.prevClipToClip = Identity();
+    constants.cameraPinholeOffset = {0.0f, 0.0f};
+    constants.cameraPos = {0.0f, 0.0f, 0.0f};
+    constants.cameraUp = {0.0f, 1.0f, 0.0f};
+    constants.cameraRight = {1.0f, 0.0f, 0.0f};
+    constants.cameraFwd = {0.0f, 0.0f, 1.0f};
+    constants.cameraNear = 0.1f;
+    constants.cameraFar = 1000.0f;
+    constants.cameraFOV = 1.0f;
+    constants.cameraAspectRatio = width / height;
+    constants.depthInverted = sl::eTrue;
+    constants.cameraMotionIncluded = sl::eTrue;
+    constants.motionVectors3D = sl::eFalse;
+    constants.motionVectorsJittered = sl::eFalse;
+    return constants;
 }
 
 VkImageMemoryBarrier Barrier(const StreamlineDlssUpscaler::Image& image, VkAccessFlags src_access,
@@ -311,33 +344,13 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
 
-        // DLSS super resolution only reads the jitter, motion and depth conventions; the camera
-        // fields are for frame generation, which this doesn't use.
         const f32 rw = static_cast<f32>(in.render_size.width);
         const f32 rh = static_cast<f32>(in.render_size.height);
-        sl::Constants constants{};
-        constants.cameraViewToClip = Identity();
-        constants.clipToCameraView = Identity();
-        constants.clipToLensClip = Identity();
-        constants.clipToPrevClip = Identity();
-        constants.prevClipToClip = Identity();
+        sl::Constants constants = BaseConstants(rw, rh);
         constants.jitterOffset = {in.jitter[0], in.jitter[1]};
         // Streamline wants motion in [-1,1] screen units; ours turns into render pixels.
         constants.mvecScale = {in.motion_vector_scale[0] / rw, in.motion_vector_scale[1] / rh};
-        constants.cameraPinholeOffset = {0.0f, 0.0f};
-        constants.cameraPos = {0.0f, 0.0f, 0.0f};
-        constants.cameraUp = {0.0f, 1.0f, 0.0f};
-        constants.cameraRight = {1.0f, 0.0f, 0.0f};
-        constants.cameraFwd = {0.0f, 0.0f, 1.0f};
-        constants.cameraNear = 0.1f;
-        constants.cameraFar = 1000.0f;
-        constants.cameraFOV = 1.0f;
-        constants.cameraAspectRatio = rw / rh;
-        constants.depthInverted = sl::eTrue;
-        constants.cameraMotionIncluded = sl::eTrue;
-        constants.motionVectors3D = sl::eFalse;
         constants.reset = reset ? sl::eTrue : sl::eFalse;
-        constants.motionVectorsJittered = sl::eFalse;
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
@@ -389,7 +402,10 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 return api_result == sl::Result::eOk;
             },
             [&] {
-                api_result = api.get_new_frame_token(frame, &index);
+                frame = Streamline::BeginEvaluation();
+                if (!frame) {
+                    api_result = api.get_new_frame_token(frame, &index);
+                }
                 return api_result == sl::Result::eOk && frame;
             },
             [&] {
@@ -398,6 +414,28 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             },
             [&] {
                 api_result = api.set_constants(constants, *frame, viewport);
+                if (api_result == sl::Result::eOk && Streamline::IsFrameGenActive()) {
+                    // The frame generator runs at present, when the game may have reused these:
+                    // Streamline copies them here.
+                    constexpr VkImageUsageFlags USAGE =
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                    sl::Resource tag_depth = depth;
+                    sl::Resource tag_motion = motion;
+                    tag_depth.usage = USAGE;
+                    tag_motion.usage = USAGE;
+                    const std::array tags{
+                        sl::ResourceTag{&tag_depth, sl::kBufferTypeDepth,
+                                        sl::ResourceLifecycle::eOnlyValidNow, &render_area},
+                        sl::ResourceTag{&tag_motion, sl::kBufferTypeMotionVectors,
+                                        sl::ResourceLifecycle::eOnlyValidNow, &render_area},
+                    };
+                    const sl::Result tagged = api.set_tag_for_frame(
+                        *frame, viewport, tags.data(), static_cast<uint32_t>(tags.size()),
+                        reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+                    if (tagged != sl::Result::eOk) {
+                        Streamline::FrameGenFailed("slSetTagForFrame", static_cast<int>(tagged));
+                    }
+                }
                 return api_result == sl::Result::eOk;
             },
             [&] {
@@ -422,6 +460,143 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
     return true;
+}
+
+StreamlineFrameTagger::StreamlineFrameTagger(const Device& device_, Scheduler& scheduler_,
+                                             MemoryAllocator& memory_allocator_)
+    : device{device_}, scheduler{scheduler_}, memory_allocator{memory_allocator_} {}
+
+StreamlineFrameTagger::~StreamlineFrameTagger() {
+    void(device.GetLogical().WaitIdle());
+}
+
+void StreamlineFrameTagger::CreateMotion(VkExtent2D size) {
+    if (motion_image) {
+        scheduler.Finish(); // the old image may still be in use
+    }
+    constexpr VkFormat FORMAT = VK_FORMAT_R16G16_SFLOAT;
+    motion_image = memory_allocator.CreateImage(VkImageCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = FORMAT,
+        .extent = {size.width, size.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    });
+    motion_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = *motion_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = FORMAT,
+        .components{},
+        .subresourceRange = COLOR_RANGE,
+    });
+    extent = size;
+    LOG_INFO(Render_Vulkan, "DLSS frame generation inputs: {}x{} depth, blank motion vectors",
+             size.width, size.height);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([image = *motion_image](vk::CommandBuffer cmdbuf) {
+        const auto barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
+                                 VkImageLayout old_layout, VkImageLayout new_layout) {
+            return VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = src_access,
+                .dstAccessMask = dst_access,
+                .oldLayout = old_layout,
+                .newLayout = new_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange = COLOR_RANGE,
+            };
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                               barrier(0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VkClearColorValue{},
+                               COLOR_RANGE);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+    });
+}
+
+void StreamlineFrameTagger::Tag(const StreamlineDlssUpscaler::Image& depth, VkExtent2D size) {
+    const bool resized = size.width != extent.width || size.height != extent.height;
+    if (resized) {
+        CreateMotion(size);
+    }
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([depth, size, resized, motion_image_handle = *motion_image,
+                      motion_view_handle = *motion_view](vk::CommandBuffer cmdbuf) {
+        if (Streamline::FrameHasInputs()) {
+            return; // a DLSS evaluation tagged this frame
+        }
+        sl::FrameToken* const frame = Streamline::BeginEvaluation();
+        if (!frame) {
+            return;
+        }
+        const Streamline::Api& api = Streamline::GetApi();
+        const sl::ViewportHandle viewport{0u};
+        sl::Constants constants =
+            BaseConstants(static_cast<f32>(size.width), static_cast<f32>(size.height));
+        constants.jitterOffset = {0.0f, 0.0f};
+        constants.mvecScale = {1.0f, 1.0f};
+        constants.reset = resized ? sl::eTrue : sl::eFalse;
+        if (const sl::Result result = api.set_constants(constants, *frame, viewport);
+            result != sl::Result::eOk) {
+            Streamline::FrameGenFailed("slSetConstants", static_cast<int>(result));
+            return;
+        }
+        constexpr VkAccessFlags DEPTH_WRITE = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        constexpr VkAccessFlags DEPTH_READ =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               Barrier(depth, DEPTH_WRITE, DEPTH_READ, VK_IMAGE_LAYOUT_GENERAL,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+        constexpr VkImageUsageFlags USAGE =
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        sl::Resource depth_resource =
+            Resource(depth.image, depth.view, depth.format,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, size, USAGE);
+        sl::Resource motion_resource =
+            Resource(motion_image_handle, motion_view_handle, VK_FORMAT_R16G16_SFLOAT,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, size, USAGE);
+        const sl::Extent area{0, 0, size.width, size.height};
+        const std::array tags{
+            sl::ResourceTag{&depth_resource, sl::kBufferTypeDepth,
+                            sl::ResourceLifecycle::eOnlyValidNow, &area},
+            sl::ResourceTag{&motion_resource, sl::kBufferTypeMotionVectors,
+                            sl::ResourceLifecycle::eOnlyValidNow, &area},
+        };
+        const sl::Result tagged = api.set_tag_for_frame(
+            *frame, viewport, tags.data(), static_cast<uint32_t>(tags.size()),
+            reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+        if (tagged != sl::Result::eOk) {
+            Streamline::FrameGenFailed("slSetTagForFrame", static_cast<int>(tagged));
+        }
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               Barrier(depth, DEPTH_READ, DEPTH_READ | DEPTH_WRITE,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       VK_IMAGE_LAYOUT_GENERAL));
+    });
+    scheduler.InvalidateState();
 }
 
 } // namespace Vulkan

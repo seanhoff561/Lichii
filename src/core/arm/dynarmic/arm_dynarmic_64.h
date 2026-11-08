@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <memory>
+#include <vector>
 #include "common/container/unordered_map.h"
 
 #include <dynarmic/interface/A64/a64.h>
@@ -60,11 +61,14 @@ public:
     void AddTicks(u64 ticks) override;
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
+    void BlockCompiled(u64 descriptor) override;
+    void FlushCompiledBlocks();
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
+    std::vector<u64> m_compiled_blocks; ///< Not saved yet (see ArmDynarmic64::PrecompileBlocks)
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};
@@ -80,6 +84,11 @@ public:
 
 class ArmDynarmic64 final : public ArmInterface {
 public:
+    /// Compiles the blocks this core compiled in earlier sessions, before the guest runs: the
+    /// game then doesn't stop to compile them on first use (it was the largest source of
+    /// stutter). EDEN_NX2_JIT_CACHE=0 turns the lists off. Returns how many it compiled.
+    std::size_t PrecompileBlocks();
+
     ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process,
                   DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index);
     ~ArmDynarmic64() override;

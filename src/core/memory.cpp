@@ -5,8 +5,12 @@
 // SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <algorithm>
+#include <bit>
+#include <memory>
+#include <unordered_map>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -45,6 +49,109 @@ u32& UnmappedReadFlag() {
     thread_local u32 flag{};
     return flag;
 }
+
+namespace {
+/// The pages with an armed read trap: a sparse bitmap (one bit per page, in chunks of 32768
+/// pages allocated on first use). It replaced a std::set<u64>, whose per-page tree search under
+/// the trap mutex took ~4% of the split GPU thread's back in Ocarina, which arms several MB of
+/// GPU-written buffers every frame.
+class ReadTrapPages {
+public:
+    /// Sets the page's bit; false if it was set already.
+    bool Insert(u64 page) {
+        u64& word = Word(page);
+        const u64 bit = u64{1} << (page % 64);
+        if ((word & bit) != 0) {
+            return false;
+        }
+        word |= bit;
+        return true;
+    }
+
+    /// Whether any page in [begin, end) is set.
+    [[nodiscard]] bool Any(u64 begin, u64 end) const {
+        bool found = false;
+        ForEachWord(begin, end, [&](const u64& word, u64 mask, u64) {
+            found = found || (word & mask) != 0;
+        });
+        return found;
+    }
+
+    /// Calls func(page) for every set page in [begin, end), lowest first.
+    template <typename Func>
+    void ForEach(u64 begin, u64 end, Func&& func) const {
+        ForEachWord(begin, end, [&](const u64& word, u64 mask, u64 first_page) {
+            for (u64 bits = word & mask; bits != 0; bits &= bits - 1) {
+                func(first_page + static_cast<u64>(std::countr_zero(bits)));
+            }
+        });
+    }
+
+    /// Clears the set pages in [begin, end), calling func(page) for each first.
+    template <typename Func>
+    void Erase(u64 begin, u64 end, Func&& func) {
+        ForEachWord(begin, end, [&](const u64& word, u64 mask, u64 first_page) {
+            u64 bits = word & mask;
+            if (bits == 0) {
+                return;
+            }
+            const_cast<u64&>(word) &= ~mask;
+            for (; bits != 0; bits &= bits - 1) {
+                func(first_page + static_cast<u64>(std::countr_zero(bits)));
+            }
+        });
+    }
+
+private:
+    static constexpr u64 ChunkPages = 1ULL << 15;
+    static constexpr u64 ChunkWords = ChunkPages / 64;
+    using Chunk = std::array<u64, ChunkWords>;
+
+    u64& Word(u64 page) {
+        const u64 index = page / ChunkPages;
+        if (index != cached_index || cached_chunk == nullptr) {
+            auto& chunk = chunks[index];
+            if (!chunk) {
+                chunk = std::make_unique<Chunk>();
+                chunk->fill(0);
+            }
+            cached_index = index;
+            cached_chunk = chunk.get();
+        }
+        return (*cached_chunk)[(page % ChunkPages) / 64];
+    }
+
+    /// Visits the words covering [begin, end) in chunks that exist, with the mask of the bits
+    /// inside the range and the page of the word's bit 0.
+    template <typename Func>
+    void ForEachWord(u64 begin, u64 end, Func&& func) const {
+        u64 page = begin;
+        while (page < end) {
+            const u64 index = page / ChunkPages;
+            const u64 chunk_end = std::min(end, (index + 1) * ChunkPages);
+            const auto it = chunks.find(index);
+            if (it == chunks.end()) {
+                page = chunk_end;
+                continue;
+            }
+            const Chunk& chunk = *it->second;
+            while (page < chunk_end) {
+                const u64 first_page = page & ~u64{63};
+                const u64 word_end = std::min(chunk_end, first_page + 64);
+                const u64 low = page - first_page;
+                const u64 count = word_end - page;
+                const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << low;
+                func(chunk[(first_page % ChunkPages) / 64], mask, first_page);
+                page = word_end;
+            }
+        }
+    }
+
+    std::unordered_map<u64, std::unique_ptr<Chunk>> chunks;
+    u64 cached_index = ~u64{0};
+    Chunk* cached_chunk = nullptr;
+};
+} // Anonymous namespace
 
 static inline bool AddressSpaceContains(const Common::PageTable& table, const Common::ProcessAddress addr, const std::size_t size) {
     const Common::ProcessAddress max_addr = 1ULL << table.GetAddressSpaceBits();
@@ -614,12 +721,17 @@ struct Memory::Impl {
                 run_pages = 0;
             }
         };
+        // Counted before the protection: a read that faults on a newly armed page must find the
+        // count nonzero. ReadTrapArmed and the disarm paths take read_trap_mutex, held here.
+        u64 armed = 0;
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
-            if (!cached || !armed_read_traps.insert(page).second) {
-                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+            if (!cached || !armed_read_traps.Insert(page)) {
+                if (run_pages > 0) {
+                    armed_read_trap_count.fetch_add(armed, std::memory_order_relaxed);
+                    armed = 0;
+                }
                 protect_run();
                 continue;
             }
@@ -627,7 +739,9 @@ struct Memory::Impl {
                 run_begin = page;
             }
             ++run_pages;
+            ++armed;
         }
+        armed_read_trap_count.fetch_add(armed, std::memory_order_relaxed);
         protect_run();
     }
 
@@ -636,8 +750,8 @@ struct Memory::Impl {
             return false;
         }
         std::scoped_lock lk{read_trap_mutex};
-        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
+        return armed_read_traps.Any(vaddr >> YUZU_PAGEBITS,
+                                    ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -647,10 +761,9 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-             it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
-        }
+        armed_read_traps.ForEach(vaddr >> YUZU_PAGEBITS, page_end, [&](u64 page) {
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+        });
     }
 
     /// A slow-path read of a cached page: its trap, if any, has done its job.
@@ -660,14 +773,12 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        while (it != armed_read_traps.end() && *it < page_end) {
+        armed_read_traps.Erase(vaddr >> YUZU_PAGEBITS, page_end, [&](u64 page) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
-            it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
-        }
+        });
     }
 
     /**
@@ -996,7 +1107,7 @@ struct Memory::Impl {
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
-    std::set<u64> armed_read_traps;
+    ReadTrapPages armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};

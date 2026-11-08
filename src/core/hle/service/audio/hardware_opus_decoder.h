@@ -6,11 +6,15 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "audio_core/opus/decoder.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/service.h"
 
 namespace Service::Audio {
+
+inline std::atomic<s64> g_opus_last_ms{};
 
 class IHardwareOpusDecoder final : public ServiceFramework<IHardwareOpusDecoder> {
 public:

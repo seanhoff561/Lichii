@@ -46,6 +46,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -598,6 +599,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
+        .support_cooperative_matrix_f16_16816 = device.SupportsCooperativeMatrixF16(true),
+        .support_cooperative_matrix_f16_1688 = device.SupportsCooperativeMatrixF16(false),
+        .max_compute_shared_memory = device.GetMaxComputeSharedMemorySize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
@@ -1197,6 +1201,18 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    // Below this many there is little memory to win (~1.8 GB), and eviction cost far more than it
+    // saved: at frame 9000 every pipeline loaded at boot for another area went at once (Ocarina:
+    // 1,427 of 1,572), and each came back at 7 ms on the GPU thread as the player reached it, up
+    // to 4 s in one frame. EDEN_NX2_PIPELINE_KEEP=<count> sets it, 0 for the old behaviour.
+    static const size_t keep = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_KEEP");
+        return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10))
+                                : size_t{4000};
+    }();
+    if (graphics_cache.size() <= keep) {
+        return;
+    }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     size_t evicted = 0;
@@ -1469,6 +1485,10 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     const auto elapsed = now - begin;
     total += elapsed;
     ++count;
+    VideoCommon::Nx2Spike::Add(VideoCommon::Nx2Spike::Counter::Pipelines);
+    VideoCommon::Nx2Spike::Add(
+        VideoCommon::Nx2Spike::Counter::PipelineNs,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
     const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // Slow builds are always logged with their shaders, to find the programs that are slow to
     // translate.
@@ -1626,6 +1646,19 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
     device.SaveShader(code);
+    // EDEN_NX2_SPV_DUMP=<dir>: write the SPIR-V of compute shaders that use tensor cores
+    // (OpCapability CooperativeMatrixKHR) before the driver sees it.
+    if (static const char* const spv_dir = std::getenv("EDEN_NX2_SPV_DUMP"); spv_dir != nullptr) {
+        for (size_t i = 5; i + 1 < code.size() && (code[i] & 0xFFFFu) == 17; i += code[i] >> 16) {
+            if (code[i + 1] == 6022) {
+                std::ofstream out(fmt::format("{}/{:016x}.spv", spv_dir, key.unique_hash),
+                                  std::ios::binary);
+                out.write(reinterpret_cast<const char*>(code.data()),
+                          static_cast<std::streamsize>(code.size() * sizeof(u32)));
+                break;
+            }
+        }
+    }
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
     // Text log + .spv dump. Same split as the graphics path.

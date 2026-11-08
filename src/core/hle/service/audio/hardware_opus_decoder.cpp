@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "core/hle/service/audio/hardware_opus_decoder.h"
 #include "core/hle/service/cmif_serialization.h"
 
@@ -128,6 +130,10 @@ Result IHardwareOpusDecoder::DecodeInterleaved(
     bool reset) {
     R_TRY(impl->DecodeInterleaved(out_data_size, out_time_taken, out_sample_count, opus_data,
                                   out_pcm_data, reset));
+    g_opus_last_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count(),
+                         std::memory_order_relaxed);
     LOG_DEBUG(Service_Audio, "reset {} bytes read {:#x} samples generated {} time taken {}", reset,
               *out_data_size, *out_sample_count, *out_time_taken);
     R_SUCCEED();

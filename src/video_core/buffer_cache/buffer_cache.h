@@ -699,7 +699,7 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
                                                u32 cbuf_offset, bool is_written,
-                                               u32 indirect_offset) {
+                                               u32 indirect_offset, bool large_native_reads) {
     if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
         LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
                   stage, ssbo_index);
@@ -742,7 +742,7 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
                              maxwell3d->GetNativeMacroEngine().native_turing ||
                                  indirect_offset != ~0U,
-                             indirect_offset != ~0U);
+                             indirect_offset != ~0U, large_native_reads);
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
@@ -2892,7 +2892,8 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                             bool native_pointer, bool table_pointer) const {
+                                             bool native_pointer, bool table_pointer,
+                                             bool large_native_reads) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -2914,7 +2915,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     constexpr size_t ways = 4;
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
     const u32 flags =
-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U);
+        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
+        (large_native_reads ? 8U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -2936,14 +2938,29 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // it (Ocarina of Time's grass instances lie 12-18 MiB past theirs): bound to the end of
             // its mapping, up to 64 MiB. The 8 MiB cap made those reads return 0 and culled every
             // blade. Written pools keep the cap: a write marks the whole binding GPU-modified.
+            // EDEN_NX2_SSBO_READ_MIB=<n>: the cap of read-only table bindings and of read-only
+            // native bindings of task/mesh programs (default 64).
+            static const u32 read_cap = [] {
+                const char* const value = std::getenv("EDEN_NX2_SSBO_READ_MIB");
+                const unsigned long mib =
+                    value != nullptr ? std::strtoul(value, nullptr, 10) : 64UL;
+                return static_cast<u32>((std::clamp)(mib, 1UL, 1024UL) << 20);
+            }();
             if (table_pointer && !is_written) {
-                return (std::min)(memory_layout_size, static_cast<u32>(64_MiB));
+                return (std::min)(memory_layout_size, read_cap);
             }
             // A native (Switch 2) compute program's pointer is bare: the word after it is another
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // Read-only bindings of task/mesh programs: like table pointers. Ocarina's Gerudo
+                // Valley cliffs read their packed vertices past 8 MiB of the pool base; the cap
+                // returned 0 for them (blue walls). Every other stage keeps 8 MiB: raising it for
+                // all grew the buffer cache by ~350 MiB and pushed Castle Town's pot room past
+                // the texture cache's limit (textures evicted and re-uploaded every frame).
+                return (std::min)(memory_layout_size,
+                                  is_written || !large_native_reads ? static_cast<u32>(8_MiB)
+                                                                    : read_cap);
             }
             const u32 packed_size = static_cast<u32>(next_qword);
             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&

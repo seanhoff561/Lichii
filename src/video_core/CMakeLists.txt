@@ -117,6 +117,8 @@ add_library(video_core STATIC
     nx2_debug_control.cpp
     nx2_debug_control.h
     nx2_profile.h
+    nx2_spike.cpp
+    nx2_spike.h
     nx2_perf.h
     nx2_download_trace.h
     pending_maps.h

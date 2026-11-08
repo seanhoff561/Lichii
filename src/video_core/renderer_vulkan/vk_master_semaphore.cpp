@@ -8,6 +8,7 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -104,6 +105,7 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    VideoCommon::Nx2Spike::Timer spike_timer{VideoCommon::Nx2Spike::Counter::GpuWaitNs};
     try {
         while (!semaphore.Wait(tick)) {
         }
@@ -235,6 +237,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
         .pSignalSemaphores = p_signal_sems,
     };
 
+    VideoCommon::Nx2Spike::Timer spike_timer{VideoCommon::Nx2Spike::Counter::SubmitNs};
     return device.GetGraphicsQueue().Submit(submit_info);
 }
 

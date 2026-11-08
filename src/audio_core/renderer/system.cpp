@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
+#include <string>
 #include <span>
 
 #include "audio_core/adsp/apps/audio_renderer/audio_renderer.h"
@@ -34,7 +36,10 @@
 #include "common/alignment.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/arm/debug.h"
 #include "core/hle/kernel/k_event.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/memory.h"
@@ -481,6 +486,57 @@ Result System::Update(std::span<const u8> input, std::span<u8> performance, std:
     if (result.IsError()) {
         LOG_ERROR(Service_Audio, "Failed to update Voices!");
         return result;
+    }
+    if (static const bool stats = std::getenv("EDEN_NX2_AUDIO_STATS") != nullptr; stats) {
+        // When every playing voice that still has queued buffers is stopped at once (the movie
+        // music pausing), log every guest thread's stack, to find the code that decided it.
+        static u32 last_live = 0;
+        static u32 stop_dumps = 0;
+        u32 live = 0, held = 0;
+        for (u32 i = 0; i < voice_context.GetCount(); ++i) {
+            const auto& voice = voice_context.GetInfo(i);
+            if (voice.in_use && voice.wave_buffer_count >= 2) {
+                const bool playing = voice.current_play_state == VoiceInfo::ServerPlayState::Started;
+                live += playing ? 1 : 0;
+                held += playing ? 0 : 1;
+            }
+        }
+        if (last_live >= 4 && live == 0 && held >= 4 && stop_dumps < 6) {
+            ++stop_dumps;
+            LOG_INFO(Service_Audio, "vstop {}: {} buffered voices stopped", stop_dumps, held);
+            Kernel::KScopedSchedulerLock sl{core.Kernel()};
+            for (auto& thread : core.ApplicationProcess()->GetThreadList()) {
+                std::string text;
+                const auto trace = Core::GetBacktrace(&thread);
+                for (size_t i = 0; i < std::min<size_t>(trace.size(), 20); ++i) {
+                    text += fmt::format(" {:x}", trace[i].original_address);
+                }
+                LOG_INFO(Service_Audio, "vstop t{} p{} c{} s{}{}", thread.GetThreadId(),
+                         thread.GetPriority(), thread.GetActiveCore(),
+                         static_cast<u32>(thread.GetState()), text);
+            }
+        }
+        last_live = live;
+        static u32 calls = 0;
+        if ((++calls % 25) == 0) {
+            u32 used = 0, started = 0, buffered = 0;
+            std::string list;
+            for (u32 i = 0; i < voice_context.GetCount(); ++i) {
+                const auto& voice = voice_context.GetInfo(i);
+                if (!voice.in_use) {
+                    continue;
+                }
+                ++used;
+                const bool playing = voice.current_play_state == VoiceInfo::ServerPlayState::Started;
+                started += playing ? 1 : 0;
+                buffered += voice.wave_buffer_count != 0 ? 1 : 0;
+                if (playing && list.size() < 120) {
+                    list += fmt::format(" {}:{}:{:.2f}:{}", i, static_cast<u32>(voice.sample_format),
+                                        voice.volume, voice.wave_buffer_count);
+                }
+            }
+            LOG_INFO(Service_Audio, "astat used {} started {} buffered {}{}", used, started, buffered, list);
+        }
     }
 
     result = info_updater.UpdateEffects(effect_context, active, memory_pool_workbuffer,

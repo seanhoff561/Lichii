@@ -136,6 +136,11 @@ void MeshEpilogue(EmitContext& ctx) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
             CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
+            if (Sirit::ValidId(ctx.mesh_point_size)) {
+                const Id output_f32{ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1])};
+                ctx.OpStore(ctx.OpAccessChain(output_f32, ctx.mesh_point_size, vertex),
+                            ctx.Const(1.0f));
+            }
             if (convert_depth) {
                 ConvertDepth(ctx, vertex);
             }
@@ -150,17 +155,20 @@ void MeshEpilogue(EmitContext& ctx) {
     for (u32 first = 0; first < mesh.max_primitives; first += threads) {
         const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
-            // Vertex indices: map bytes 4 + 3 * primitive.
-            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
+            // Vertex indices: map bytes 4 + n * primitive, n = 1 (points), 2 (lines), 3.
+            const u32 n{mesh.IndicesPerPrimitive()};
+            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(n)),
                                      ctx.Const(4U))};
             std::array<Id, 3> indices;
-            for (u32 element = 0; element < 3; ++element) {
+            for (u32 element = 0; element < n; ++element) {
                 const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
                 indices[element] = ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address));
             }
-            const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
+            const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[n])};
             ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
-                        ctx.OpCompositeConstruct(ctx.U32[3], std::span<const Id>(indices)));
+                        n == 1 ? indices[0]
+                               : ctx.OpCompositeConstruct(ctx.U32[n],
+                                                          std::span<const Id>(indices.data(), n)));
             CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
                       ctx.mesh_primitive_targets);
         });

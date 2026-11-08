@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 #include <fmt/ranges.h>
 
@@ -181,6 +183,37 @@ std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> Tas::GetStatus()
 }
 
 void Tas::UpdateThread() {
+    // EDEN_NX2_INPUT_FILE=<path>: player 1 holds the input in that file, one line
+    // "BUTTONS lx;ly rx;ry end" in the TAS script format, re-read every frame. Lets a test
+    // driver play the game without keyboard focus. A line without the "end" token is a
+    // partial write and keeps the previous input.
+    if (static const char* const input_file = std::getenv("EDEN_NX2_INPUT_FILE"); input_file) {
+        std::ifstream stream(input_file);
+        std::string line;
+        if (stream && std::getline(stream, line)) {
+            std::vector<std::string> seg_list;
+            std::istringstream line_stream(line);
+            for (std::string segment; std::getline(line_stream, segment, ' ');) {
+                if (!segment.empty()) {
+                    seg_list.push_back(segment);
+                }
+            }
+            if (seg_list.size() == 4 && seg_list[3] == "end") {
+                const u64 buttons = ReadCommandButtons(seg_list[0]);
+                const TasAnalog l_axis = ReadCommandAxis(seg_list[1]);
+                const TasAnalog r_axis = ReadCommandAxis(seg_list[2]);
+                const PadIdentifier identifier{.guid = Common::UUID{}, .port = 0, .pad = 0};
+                for (std::size_t i = 0; i < sizeof(buttons) * 8; ++i) {
+                    SetButton(identifier, static_cast<int>(i), (buttons & (1LLU << i)) != 0);
+                }
+                SetTasAxis(identifier, TasAxis::StickX, l_axis.x);
+                SetTasAxis(identifier, TasAxis::StickY, l_axis.y);
+                SetTasAxis(identifier, TasAxis::SubstickX, r_axis.x);
+                SetTasAxis(identifier, TasAxis::SubstickY, r_axis.y);
+            }
+        }
+        return;
+    }
     if (!Settings::values.tas_enable) {
         if (is_running) {
             Stop();

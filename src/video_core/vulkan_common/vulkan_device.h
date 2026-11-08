@@ -84,7 +84,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, ShaderMaximalReconvergence, SHADER_MAXIMAL_RECONVERGENCE,                        \
             shader_maximal_reconvergence)                                                        \
     FEATURE(KHR, WorkgroupMemoryExplicitLayout, WORKGROUP_MEMORY_EXPLICIT_LAYOUT,                  \
-            workgroup_memory_explicit_layout)
+            workgroup_memory_explicit_layout)                                                      \
+    FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)
 
 
 // Define miscellaneous extensions which may be used by the implementation here.
@@ -660,6 +661,12 @@ FN_MAX_LIMIT_LIST
                features.features.shaderInt16;
     }
 
+    /// Returns true if subgroup-scope fp16 matrix multiply-add of this shape (fp16 accumulator)
+    /// runs on VK_KHR_cooperative_matrix: 16x8x16 (k16) or 16x8x8.
+    bool SupportsCooperativeMatrixF16(bool k16) const {
+        return k16 ? cooperative_matrix_f16_16816 : cooperative_matrix_f16_1688;
+    }
+
     /// Returns true if the device supports VK_KHR_shader_quad_control.
     bool IsKhrShaderQuadControlSupported() const {
         return extensions.shader_quad_control && features.shader_quad_control.shaderQuadControl;
@@ -1232,6 +1239,11 @@ private:
     /// Returns a list of queue initialization descriptors.
     std::vector<VkDeviceQueueCreateInfo> GetDeviceQueueCreateInfos() const;
 
+#ifdef EGLANTINE_STREAMLINE
+    /// Picks the queue families DLSS frame generation needs, or leaves it off.
+    void SetupFrameGenFamilies(std::span<const VkQueueFamilyProperties> families);
+#endif
+
     /// Returns true if ASTC textures are natively supported.
     bool ComputeIsOptimalAstcSupported() const;
 
@@ -1248,6 +1260,8 @@ private:
     mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
+    bool cooperative_matrix_f16_16816{}; ///< VK_KHR_cooperative_matrix fp16 16x8x16, subgroup
+    bool cooperative_matrix_f16_1688{};  ///< VK_KHR_cooperative_matrix fp16 16x8x8, subgroup
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
@@ -1349,6 +1363,10 @@ private:
     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
+    bool streamline_frame_gen{};  ///< DLSS frame generation's extensions and queues are set up.
+    bool streamline_native_optical_flow{}; ///< It has its own optical flow queue.
+    u32 streamline_compute_family{};
+    u32 streamline_optical_flow_family{};
     bool streamline_attached{};   ///< Streamline has this device.
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.

@@ -6,6 +6,8 @@
 
 #ifdef _WIN32
 
+#include <atomic>
+#include <cstdlib>
 #include <iterator>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
@@ -992,11 +994,44 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+#ifdef _WIN32
+namespace {
+// Pages marked cold fault back in on their next use, so that is only worth it when RAM is short.
+// EDEN_NX2_COLD_HINT_FREE_MIB: hint below this much available RAM (default 2048, 0 = always).
+bool ColdHintsWanted() {
+    static const u64 min_free = [] {
+        const char* const text = std::getenv("EDEN_NX2_COLD_HINT_FREE_MIB");
+        return (text != nullptr ? static_cast<u64>(std::atoll(text)) : u64{2048}) * 1024 * 1024;
+    }();
+    if (min_free == 0) {
+        return true;
+    }
+    static std::atomic<u64> next_check_ms{0};
+    static std::atomic<bool> wanted{true};
+    const u64 now_ms = GetTickCount64();
+    if (now_ms >= next_check_ms.load(std::memory_order_relaxed)) {
+        next_check_ms.store(now_ms + 250, std::memory_order_relaxed);
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) {
+            wanted.store(status.ullAvailPhys < min_free, std::memory_order_relaxed);
+        }
+    }
+    return wanted.load(std::memory_order_relaxed);
+}
+} // Anonymous namespace
+#endif
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
     if (length == 0 || backing_base == nullptr) {
         return;
     }
+#ifdef _WIN32
+    if (!ColdHintsWanted()) {
+        return;
+    }
+#endif
     const auto hint = [length](u8* address) {
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.

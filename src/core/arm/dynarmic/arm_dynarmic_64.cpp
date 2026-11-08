@@ -4,11 +4,19 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
+#include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include <fmt/format.h>
+
+#include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -52,6 +60,78 @@ u64 DynarmicCallbacks64::MemoryRead(u64 vaddr, size_t size) {
 Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
     CheckMemoryAccess(vaddr, 16, Kernel::DebugWatchpointType::Read);
     return {m_memory.Read64(vaddr), m_memory.Read64(vaddr + 8)};
+}
+
+namespace {
+// The location descriptor's address bits; the bits above them are FPCR state.
+constexpr u64 DescriptorPcMask = 0x00FF'FFFF'FFFF'FFFFULL;
+// Code stays this close to the process's first module.
+constexpr u64 CodeSpan = u64{1} << 30;
+
+std::filesystem::path BlockListPath(const Kernel::KProcess& process, std::size_t core_index) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "jit" /
+           fmt::format("{:016X}_{}.blocks", process.GetProgramId(), core_index);
+}
+
+bool BlockListsEnabled(const Kernel::KProcess& process) {
+    static const bool enabled = [] {
+        const char* const text = std::getenv("EDEN_NX2_JIT_CACHE");
+        return text == nullptr || text[0] != '0';
+    }();
+    return enabled && process.IsApplication();
+}
+} // Anonymous namespace
+
+void DynarmicCallbacks64::BlockCompiled(u64 descriptor) {
+    if (m_process == nullptr || !BlockListsEnabled(*m_process)) {
+        return;
+    }
+    const u64 base = GetInteger(m_process->GetEntryPoint());
+    const u64 pc = descriptor & DescriptorPcMask;
+    if (pc < base || pc - base >= CodeSpan) {
+        return;
+    }
+    m_compiled_blocks.push_back((descriptor & ~DescriptorPcMask) | (pc - base));
+    if (m_compiled_blocks.size() >= 512) {
+        FlushCompiledBlocks();
+    }
+}
+
+void DynarmicCallbacks64::FlushCompiledBlocks() {
+    if (m_compiled_blocks.empty() || m_process == nullptr) {
+        return;
+    }
+    std::error_code error;
+    const auto path = BlockListPath(*m_process, m_parent.m_core_index);
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::ofstream file(path, std::ios::binary | std::ios::app);
+    file.write(reinterpret_cast<const char*>(m_compiled_blocks.data()),
+               static_cast<std::streamsize>(m_compiled_blocks.size() * sizeof(u64)));
+    m_compiled_blocks.clear();
+}
+
+std::size_t ArmDynarmic64::PrecompileBlocks() {
+    const Kernel::KProcess* const process = m_cb->m_process;
+    if (process == nullptr || !BlockListsEnabled(*process)) {
+        return 0;
+    }
+    std::ifstream file(BlockListPath(*process, m_core_index),
+                       std::ios::binary | std::ios::ate);
+    if (!file) {
+        return 0;
+    }
+    const auto bytes = static_cast<std::size_t>(file.tellg());
+    std::vector<u64> blocks(bytes / sizeof(u64));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(blocks.data()),
+              static_cast<std::streamsize>(blocks.size() * sizeof(u64)));
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+    const u64 base = GetInteger(process->GetEntryPoint());
+    for (u64& block : blocks) {
+        block = (block & ~DescriptorPcMask) | (((block & DescriptorPcMask) + base) & DescriptorPcMask);
+    }
+    return m_jit->Precompile(blocks.data(), blocks.size());
 }
 
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
@@ -503,7 +583,9 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
 }
 
-ArmDynarmic64::~ArmDynarmic64() = default;
+ArmDynarmic64::~ArmDynarmic64() {
+    m_cb->FlushCompiledBlocks();
+}
 
 void ArmDynarmic64::SetTpidrroEl0(u64 value) {
     m_cb->m_tpidrro_el0 = value;

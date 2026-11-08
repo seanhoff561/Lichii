@@ -7,6 +7,9 @@
  */
 
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -26,6 +29,12 @@
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt_passes.h"
+
+namespace Dynarmic {
+std::atomic<std::uint64_t> g_nx2_jit_ns{};
+std::atomic<std::uint64_t> g_nx2_jit_blocks{};
+std::atomic<std::uint64_t> g_nx2_jit_flushes{};
+} // namespace Dynarmic
 
 namespace Dynarmic::A64 {
 
@@ -70,6 +79,24 @@ public:
     }
 
     ~Impl() = default;
+
+    std::size_t Precompile(const std::uint64_t* descriptors, std::size_t count) {
+        constexpr size_t RESERVED_CODESIZE = 64 * 1024 * 1024;
+        precompiling = true;
+        std::size_t compiled = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (block_of_code.SpaceRemaining() < RESERVED_CODESIZE) {
+                break;
+            }
+            const IR::LocationDescriptor descriptor{descriptors[i]};
+            if (!emitter.GetBasicBlock(descriptor)) {
+                GetBlock(descriptor);
+                ++compiled;
+            }
+        }
+        precompiling = false;
+        return compiled;
+    }
 
     HaltReason Run() {
         ASSERT(!is_executing);
@@ -254,13 +281,23 @@ private:
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
         // JIT Compile
+        const auto jit_begin = std::chrono::steady_clock::now();
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::Optimize(ir_block, conf, polyfill_options);
-        return emitter.Emit(ir_block).entrypoint;
+        const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+        g_nx2_jit_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - jit_begin)
+                                   .count(),
+                               std::memory_order_relaxed);
+        g_nx2_jit_blocks.fetch_add(1, std::memory_order_relaxed);
+        if (!precompiling) {
+            conf.callbacks->BlockCompiled(descriptor.Value());
+        }
+        return entrypoint;
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
@@ -268,6 +305,7 @@ private:
             std::unique_lock lock{invalidation_mutex};
 
             ClearHalt(HaltReason::CacheInvalidation);
+            g_nx2_jit_flushes.fetch_add(1, std::memory_order_relaxed);
 
             if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
                 return;
@@ -293,6 +331,7 @@ private:
     Optimization::PolyfillOptions polyfill_options;
     bool is_executing = false;
     bool invalidate_entire_cache = false;
+    bool precompiling = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
 };
@@ -304,6 +343,10 @@ Jit::~Jit() = default;
 
 HaltReason Jit::Run() {
     return impl->Run();
+}
+
+std::size_t Jit::Precompile(const std::uint64_t* descriptors, std::size_t count) {
+    return impl->Precompile(descriptors, count);
 }
 
 HaltReason Jit::Step() {

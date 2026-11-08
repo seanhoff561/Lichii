@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 
@@ -12,6 +13,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -71,6 +73,28 @@ void ReleaseFences(DmaPusher& dma_pusher) {
 }
 
 } // Anonymous namespace
+
+namespace {
+// The releases last sent to the back, by address (front thread only).
+struct QueuedRelease {
+    GPUVAddr address{};
+    u32 payload{};
+};
+std::array<QueuedRelease, 256> g_queued_releases{};
+
+size_t QueuedReleaseSlot(GPUVAddr address) {
+    return ((address >> 2) ^ (address >> 10) ^ (address >> 18)) % g_queued_releases.size();
+}
+
+void NoteQueuedRelease(GPUVAddr address, u32 payload) {
+    g_queued_releases[QueuedReleaseSlot(address)] = {address, payload};
+}
+} // Anonymous namespace
+
+bool Puller::MatchesQueuedRelease(const PendingAcquire& acquire) {
+    const QueuedRelease& release = g_queued_releases[QueuedReleaseSlot(acquire.address)];
+    return release.address == acquire.address && acquire.Matches(release.payload);
+}
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
@@ -235,9 +259,14 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
+        NoteQueuedRelease(sequence_address, payload);
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.NoteGuestWrite(sequence_address);
+            split.NoteGuestWrite(sequence_address + 12);
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -255,9 +284,33 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // EDEN_NX2_ACQUIRE_FAST: an acquire already met needs nothing from the back, and neither
+        // does one a release queued before it will meet: the back runs them in this order.
+        static const bool acquire_fast = std::getenv("EDEN_NX2_ACQUIRE_FAST") != nullptr;
+        bool early = false;
+        const bool spike = VideoCommon::Nx2Spike::Enabled();
+        if (spike || acquire_fast) {
+            early = acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address));
+            const bool queued = !early && MatchesQueuedRelease(acquire);
+            if (spike) {
+                VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::AcquireChecks);
+                if (early) {
+                    VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::AcquireEarly);
+                }
+                if (queued) {
+                    VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::AcquireQueued);
+                }
+            }
+            if (acquire_fast && (early || queued)) {
+                return;
+            }
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
+        }
+        if (early) {
+            VideoCommon::Nx2Spike::Note(VideoCommon::Nx2Spike::Stat::AcquireStale);
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.

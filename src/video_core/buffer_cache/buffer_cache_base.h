@@ -292,7 +292,8 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written, u32 indirect_offset = ~0U);
+                                   bool is_written, u32 indirect_offset = ~0U,
+                                   bool large_native_reads = false);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -583,7 +584,8 @@ private:
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
-                                               bool table_pointer = false) const;
+                                               bool table_pointer = false,
+                                               bool large_native_reads = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,

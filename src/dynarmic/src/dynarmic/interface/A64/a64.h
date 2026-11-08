@@ -32,6 +32,10 @@ public:
      */
     HaltReason Run();
 
+    /// Compiles the blocks at these location descriptors (as UserCallbacks::BlockCompiled gave
+    /// them) before they are first run. Not while the Jit runs. Returns how many it compiled.
+    std::size_t Precompile(const std::uint64_t* descriptors, std::size_t count);
+
     /**
      * Step the emulated CPU for one instruction.
      * Cannot be recursively called.

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <climits>
@@ -109,6 +110,19 @@ Id DefineVariable(EmitContext& ctx, Id type, std::optional<spv::BuiltIn> builtin
     }
     ctx.interfaces.push_back(id);
     return id;
+}
+
+// Games draw a depth pre-pass and then color with depth EQUAL, from two programs whose position
+// math is the same. Invariant makes the driver compute both the same way.
+// EDEN_NX2_INVARIANT_POS=0 leaves it off.
+void DecorateInvariantPosition(EmitContext& ctx, Id position) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_INVARIANT_POS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (enabled) {
+        ctx.Decorate(position, spv::Decoration::Invariant);
+    }
 }
 
 u32 NumVertices(InputTopology input_topology) {
@@ -1824,9 +1838,13 @@ void EmitContext::DefineMesh(const IR::Program& program) {
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
-    mesh_primitive_indices =
-        DefineVariable(*this, TypeArray(U32[3], primitive_count),
-                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
+    const u32 indices_per_primitive{mesh_info.IndicesPerPrimitive()};
+    mesh_primitive_indices = DefineVariable(
+        *this, TypeArray(U32[indices_per_primitive], primitive_count),
+        indices_per_primitive == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
+        : indices_per_primitive == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
+                                     : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
+        spv::StorageClass::Output);
     std::array<Id, IR::NUM_GENERICS> generics[2]{};
     Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
@@ -1873,6 +1891,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
+                DecorateInvariantPosition(*this, output_position);
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
@@ -1892,6 +1911,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
+    // Points need a size; a program that writes none gets 1.0 (the hardware default).
+    if (indices_per_primitive == 1 && !Sirit::ValidId(point_size)) {
+        mesh_point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count),
+                                         spv::BuiltIn::PointSize, spv::StorageClass::Output);
+    }
 }
 
 void EmitContext::DefineOutputs(const IR::Program& program) {
@@ -1903,6 +1927,7 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        DecorateInvariantPosition(*this, output_position);
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {

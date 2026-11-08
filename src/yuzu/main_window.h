@@ -278,6 +278,7 @@ private:
     void BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                   StartGameType with_config = StartGameType::Normal);
     void BootGameFromList(const QString& filename, StartGameType with_config);
+    void AutoLaunchGame();
     void ShutdownGame();
     void TerminateEmulationThread();
 

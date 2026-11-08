@@ -12,7 +12,10 @@
 
 #include <sl.h>
 #include <sl_dlss.h>
+#include <sl_dlss_g.h>
 #include <sl_helpers_vk.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
 
 namespace Vulkan::Streamline {
 
@@ -25,6 +28,7 @@ struct Api {
     PFun_slGetFeatureFunction* get_feature_function{};
     PFun_slGetNewFrameToken* get_new_frame_token{};
     PFun_slSetConstants* set_constants{};
+    PFun_slSetTagForFrame* set_tag_for_frame{};
     PFun_slEvaluateFeature* evaluate_feature{};
     PFun_slFreeResources* free_resources{};
     PFun_slSetVulkanInfo* set_vulkan_info{};
@@ -32,5 +36,12 @@ struct Api {
 
 /// The loaded functions; only valid while IsDlssAvailable().
 [[nodiscard]] const Api& GetApi();
+
+/// The frame the coming DLSS evaluation belongs to, with its markers set; the frame generator
+/// reads this token's constants and tags. Null without frame generation.
+[[nodiscard]] sl::FrameToken* BeginEvaluation();
+
+/// Whether this frame's token has its constants and tags already.
+[[nodiscard]] bool FrameHasInputs();
 
 } // namespace Vulkan::Streamline

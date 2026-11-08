@@ -42,7 +42,10 @@
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
+#include "core/arm/debug.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/service/audio/hardware_opus_decoder.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
@@ -1740,6 +1743,18 @@ private:
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        // EDEN_NX2_PEEK=<hex offset from the entry point>: logs four guest words every 120 presents.
+        static const u64 peek = [] {
+            const char* value = std::getenv("EDEN_NX2_PEEK");
+            return value ? std::strtoull(value, nullptr, 16) : u64{0};
+        }();
+        if (peek != 0 && (m_presents % 120) == 0) {
+            auto& memory = system.ApplicationMemory();
+            const u64 address = GetInteger(system.ApplicationProcess()->GetEntryPoint()) + peek;
+            LOG_INFO(Service, "nx2:vi2 peek {:#x}: {:08x} {:08x} {:08x} {:08x}", address,
+                     memory.Read32(address), memory.Read32(address + 4), memory.Read32(address + 8),
+                     memory.Read32(address + 12));
+        }
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
@@ -1926,7 +1941,16 @@ private:
         if (forced_interval != 0) {
             swap_interval = forced_interval;
         }
-        const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
+        // EDEN_NX2_VSYNC_HZ also moves this cap: with only the vsync event moved, presents still
+        // wait for 60 Hz.
+        static const u32 forced_refresh = [] {
+            const char* value = std::getenv("EDEN_NX2_VSYNC_HZ");
+            return value ? std::clamp<u32>(static_cast<u32>(std::strtoul(value, nullptr, 10)), 30, 240)
+                         : 0U;
+        }();
+        const u32 refresh_rate = forced_refresh != 0                                    ? forced_refresh
+                                 : (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff
+                                                                                       : 60;
         if (trace) {
             m_frame_trace.interval = swap_interval;
             m_frame_trace.refresh = refresh_rate;
@@ -2693,6 +2717,8 @@ private:
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
+        } else {
+            m_cv.notify_all(); // opens the decoder for the new codec ahead of input
         }
         TipcReplyWords(ctx, {});
     }
@@ -2908,6 +2934,7 @@ private:
             }
         }
         if (!output) {
+            ++m_stat_empty;
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service, "nx2:vdec trace output empty syncpoint={} result=0x1c286f",
                          m_syncpoint);
@@ -2918,6 +2945,139 @@ private:
             return;
         }
         const u64 pts_ns = output->pts * 1000;
+        if (static const bool stats = std::getenv("EDEN_NX2_VIDEO_STATS") != nullptr; stats) {
+            static auto last = std::chrono::steady_clock::now();
+            static u32 taken = 0;
+            ++taken;
+            const auto now = std::chrono::steady_clock::now();
+            static auto last_taken = now;
+            static s64 gap_max = 0;
+            gap_max = std::max<s64>(gap_max, std::chrono::duration_cast<std::chrono::milliseconds>(now - last_taken).count());
+            last_taken = now;
+            if (now - last >= std::chrono::milliseconds{500}) {
+                std::scoped_lock lk{m_mutex};
+                const auto lag = now - (m_pace_base + std::chrono::microseconds(output->pts));
+                LOG_INFO(Service, "vstat taken {} pts {} ms lag {} ms decoded {} inputs {} free {} dropped {} empty {} gap {} ms",
+                         taken, output->pts / 1000,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(lag).count(),
+                         m_decoded.size(), m_inputs.Size(), m_free.size(), m_pace_dropped,
+                         m_stat_empty, gap_max);
+                LOG_INFO(Service, "vtime image wait {} idle {} release {} write {} decode {} ms",
+                         m_stat_image_wait.exchange(0) / 1000000, m_stat_idle.exchange(0) / 1000000,
+                         m_stat_release.exchange(0) / 1000000, m_stat_write.exchange(0) / 1000000,
+                         m_stat_decode.exchange(0) / 1000000);
+                m_stat_empty = 0;
+                gap_max = 0;
+                last = now;
+                taken = 0;
+                const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       now.time_since_epoch()).count();
+                const s64 quiet = now_ms - Audio::g_opus_last_ms.load(std::memory_order_relaxed);
+                static u32 dumps = 0;
+                static u32 rounds_log = 0;
+                static bool stalled = false;
+                const bool stall = quiet > 2500 && output->pts > 5000000;
+                static s64 quiet_max = 0;
+                quiet_max = std::max(quiet_max, quiet);
+                if ((rounds_log++ % 20) == 0) {
+                    LOG_INFO(Service, "gquiet now {} max {}", quiet, quiet_max);
+                    quiet_max = 0;
+                }
+                // EDEN_NX2_CODE_DUMP=<directory>: save the game's modules once, to read the code
+                // behind the stacks above (kept on this PC).
+                if (static bool code_dumped = false; !code_dumped && output->pts > 5000000) {
+                    code_dumped = true;
+                    if (const char* const directory = std::getenv("EDEN_NX2_CODE_DUMP")) {
+                        // The modules carry no names here, so walk the code regions directly:
+                        // each run of Code / AliasCode memory (text, rodata, data) is one file.
+                        auto* const process = system.ApplicationProcess();
+                        auto& page_table = process->GetPageTable();
+                        u64 address = 0;
+                        u64 run_begin = 0;
+                        u64 run_end = 0;
+                        const auto flush = [&] {
+                            if (run_end <= run_begin) {
+                                return;
+                            }
+                            std::vector<u8> bytes(run_end - run_begin);
+                            system.ApplicationMemory().ReadBlock(run_begin, bytes.data(), bytes.size());
+                            const std::string path = fmt::format("{}/code_{:x}.bin", directory, run_begin);
+                            if (std::FILE* const file = std::fopen(path.c_str(), "wb")) {
+                                std::fwrite(bytes.data(), 1, bytes.size(), file);
+                                std::fclose(file);
+                            }
+                            LOG_INFO(Service, "code dump at {:#x} size {:#x}", run_begin, bytes.size());
+                            run_begin = run_end = 0;
+                        };
+                        while (true) {
+                            Kernel::KMemoryInfo mem_info{};
+                            Kernel::Svc::PageInfo page_info{};
+                            if (page_table.QueryInfo(std::addressof(mem_info), std::addressof(page_info), address).IsError()) {
+                                break;
+                            }
+                            const auto info = mem_info.GetSvcMemoryInfo();
+                            const bool code = info.state == Kernel::Svc::MemoryState::Code ||
+                                              info.state == Kernel::Svc::MemoryState::AliasCode ||
+                                              info.state == Kernel::Svc::MemoryState::CodeData ||
+                                              info.state == Kernel::Svc::MemoryState::AliasCodeData;
+                            if (code && info.size < (u64{1} << 32)) {
+                                if (run_end != info.base_address) {
+                                    flush();
+                                    run_begin = info.base_address;
+                                }
+                                run_end = info.base_address + info.size;
+                            } else {
+                                flush();
+                            }
+                            const u64 next = info.base_address + info.size;
+                            if (next <= address) {
+                                break;
+                            }
+                            address = next;
+                        }
+                        flush();
+                    }
+                }
+                if (stall && !stalled && dumps < 5) {
+                    ++dumps;
+                    LOG_INFO(Service, "gdump {} opus quiet {} ms", dumps, quiet);
+                    Kernel::KScopedSchedulerLock sl{system.Kernel()};
+                    for (auto& thread : system.ApplicationProcess()->GetThreadList()) {
+                        std::string text;
+                        const auto trace = Core::GetBacktrace(&thread);
+                        for (size_t i = 0; i < std::min<size_t>(trace.size(), 16); ++i) {
+                            text += fmt::format(" {:x}{}{}", trace[i].original_address, trace[i].name.empty() ? "" : "=", trace[i].name.substr(0, 60));
+                        }
+                        LOG_INFO(Service, "gdump t{} p{} c{} s{}{}", thread.GetThreadId(), thread.GetPriority(),
+                                 thread.GetActiveCore(), static_cast<u32>(thread.GetState()), text);
+                    }
+                }
+                stalled = stall;
+                static u32 rounds = 0;
+                if ((++rounds % 4) == 0) {
+                    static std::unordered_map<u64, s64> seen;
+                    std::vector<std::pair<s64, std::string>> rows;
+                    {
+                        Kernel::KScopedSchedulerLock sl{system.Kernel()};
+                        for (auto& thread : system.ApplicationProcess()->GetThreadList()) {
+                            const s64 time = thread.GetCpuTime();
+                            auto& before = seen[thread.GetThreadId()];
+                            const s64 delta = time - before;
+                            before = time;
+                            rows.emplace_back(delta, fmt::format(" {}/p{}/c{}/{}:{}", thread.GetThreadId(),
+                                                                 thread.GetPriority(), thread.GetActiveCore(),
+                                                                 static_cast<u32>(thread.GetState()), delta / 100000));
+                        }
+                    }
+                    std::ranges::sort(rows, std::greater{});
+                    std::string text;
+                    for (size_t i = 0; i < std::min<size_t>(rows.size(), 14); ++i) {
+                        text += rows[i].second;
+                    }
+                    LOG_INFO(Service, "gthr n{}{}", rows.size(), text);
+                }
+            }
+        }
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace output syncpoint={} image={} size={}x{} pts={} eos={}",
                      m_syncpoint, output->image, output->width, output->height, output->pts,
@@ -2929,6 +3089,74 @@ private:
                              0, 0, 0});
     }
 
+    /// Whether movies follow the wall clock (EDEN_NX2_VIDEO_PACE=0 restores one picture per take).
+    [[nodiscard]] bool PacesVideo() const {
+        static const bool switched_on = [] {
+            const char* const value = std::getenv("EDEN_NX2_VIDEO_PACE");
+            return !value || value[0] != '0';
+        }();
+        return switched_on && system.GetApplicationProcessProgramID() == 0x0400486024DEC000ULL;
+    }
+
+    /// EDEN_NX2_VIDEO_LEAD_MS=<ms>: show movie pictures that much ahead of the wall clock.
+    [[nodiscard]] static std::chrono::microseconds VideoLead() {
+        static const std::chrono::microseconds lead{[] {
+            const char* const value = std::getenv("EDEN_NX2_VIDEO_LEAD_MS");
+            return value ? std::strtoll(value, nullptr, 10) * 1000 : 0LL;
+        }()};
+        return lead;
+    }
+
+    /// Ocarina shows one movie picture per rendered frame, so under 60 fps a movie falls behind
+    /// its sound, and the sound drops out as the game keeps the two together. Skips pictures that
+    /// are already late. The clock restarts when the client stops taking pictures (pause, load).
+    [[nodiscard]] bool DropLatePicture(const Decoded& frame) {
+        using namespace std::chrono_literals;
+        if (!PacesVideo()) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto media = std::chrono::microseconds(frame.pts);
+        if (!m_pace_valid || now - m_pace_last > 250ms) {
+            m_pace_base = now - media;
+            m_pace_valid = true;
+            m_pace_run = 0;
+        }
+        m_pace_last = now;
+        const auto late = now + VideoLead() - (m_pace_base + media);
+        if (frame.end || late <= 25ms) {
+            m_pace_run = 0;
+            return false;
+        }
+        if (m_pace_run >= 4) {
+            // Show something. A movie this far behind has stalled, so don't chase the old clock.
+            m_pace_run = 0;
+            if (late > 250ms) {
+                m_pace_base = now - media;
+            }
+            return false;
+        }
+        ++m_pace_run;
+        if ((++m_pace_dropped % 300) == 1) {
+            LOG_INFO(Service, "{} dropped {} late pictures so far",
+                     GetServiceName(), m_pace_dropped);
+        }
+        return true;
+    }
+
+    /// Above 60 fps the opposite happens, so a picture waits for its time.
+    void HoldEarlyPicture(u64 pts) const {
+        using namespace std::chrono_literals;
+        if (!PacesVideo() || !m_pace_valid) {
+            return;
+        }
+        const auto due = m_pace_base + std::chrono::microseconds(pts) - VideoLead();
+        const auto early = due - std::chrono::steady_clock::now();
+        if (early > 8ms && early < 100ms) {
+            std::this_thread::sleep_for(early - 4ms);
+        }
+    }
+
     // The decode thread: turns queued input into decoded frames and decoded frames into output
     // images, in order.
     void DecodeLoop() {
@@ -2938,15 +3166,39 @@ private:
         std::vector<u8> bytes;
         std::unique_lock lk{m_mutex};
         while (true) {
+            const auto wait_begin = std::chrono::steady_clock::now();
+            const bool starved_of_images = !m_decoded.empty() && m_free.empty();
+            const auto needs_decoder = [&] {
+                return !m_codec.empty() && (!decoder || decoder->Name() != m_codec);
+            };
             m_cv.wait(lk, [&] {
                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
-                       (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
+                       (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead) ||
+                       needs_decoder();
             });
+            (starved_of_images ? m_stat_image_wait : m_stat_idle) += (std::chrono::steady_clock::now() - wait_begin).count();
             if (m_quit) {
                 return;
             }
+            if (needs_decoder()) {
+                // Open the decoder as soon as the codec is configured, not at the first input:
+                // the client waits for its first picture, and opening the decoder (FFmpeg, its
+                // threads, a hardware device) inside that wait stalled Ocarina's title for a
+                // frame long enough to stop its music.
+                const std::string codec = m_codec;
+                lk.unlock();
+                const auto open_begin = std::chrono::steady_clock::now();
+                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+                LOG_INFO(Service, "{} decoder opened ahead of input in {} ms", GetServiceName(),
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - open_begin)
+                             .count());
+                lk.lock();
+                continue;
+            }
             if (m_flush) {
                 m_flush = false;
+                m_pace_valid = false;
                 m_decoded.clear();
                 if (decoder) {
                     lk.unlock();
@@ -2958,6 +3210,9 @@ private:
             if (!m_decoded.empty() && !m_free.empty()) {
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
+                if (DropLatePicture(frame)) {
+                    continue;
+                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -2966,10 +3221,15 @@ private:
                     m_release_fences.erase(it);
                 }
                 lk.unlock();
+                const auto release_begin = std::chrono::steady_clock::now();
                 if (fence) {
                     WaitForRelease(*fence);
                 }
+                const auto write_begin = std::chrono::steady_clock::now();
+                m_stat_release += (write_begin - release_begin).count();
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                m_stat_write += (std::chrono::steady_clock::now() - write_begin).count();
+                HoldEarlyPicture(frame.pts);
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
@@ -3016,7 +3276,9 @@ private:
                 decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
             }
             pictures.clear();
+            const auto decode_begin = std::chrono::steady_clock::now();
             decoder->Decode(input.data, input.pts, pictures);
+            m_stat_decode += (std::chrono::steady_clock::now() - decode_begin).count();
             if (input.end) {
                 decoder->Drain(pictures);
             }
@@ -3222,9 +3484,17 @@ private:
     u32 m_height{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
+    std::chrono::steady_clock::time_point m_pace_base{}; ///< When a pts of 0 would be shown
+    std::chrono::steady_clock::time_point m_pace_last{}; ///< When the client last took a picture
+    u64 m_pace_dropped{};
+    u32 m_pace_run{};
+    bool m_pace_valid{};
     u64 m_decoded_frames{};
     Nx2VideoInputQueue m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
+    u32 m_stat_empty{}; ///< Empty GetOutputInfo answers since the last vstat line
+    std::atomic<s64> m_stat_image_wait{}, m_stat_idle{}, m_stat_release{}, m_stat_write{},
+        m_stat_decode{}; ///< Decode thread time in ns since the last vstat line
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213

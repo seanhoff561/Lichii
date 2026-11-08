@@ -96,6 +96,9 @@ public:
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
+    const Shader::Info& StageInfo(size_t stage) const noexcept {
+        return stage_infos[stage];
+    }
 
     struct SampledImage {
         u32 stage;

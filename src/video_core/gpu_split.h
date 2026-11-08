@@ -3,11 +3,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 #include <type_traits>
 
@@ -34,6 +36,7 @@ enum class DrainSite : u32 {
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
     MacroDmaRead,   ///< The front's macros read memory (MME DMA)
+    MacroWriters,   ///< Those reads: the dispatches and copies sent before them
     MacroDmaFlush,  ///< Those words are in the buffer cache
     GpSyncFence,    ///< A GP entry's sync bit (sync_memory_operations)
     Map,            ///< GPU memory maps before later command reads
@@ -44,7 +47,8 @@ enum class DrainSite : u32 {
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
-    "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
+    "list writers", "list sync",      "list flush", "macro dma read",  "macro writers",
+    "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",
 };
 
@@ -71,6 +75,9 @@ public:
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
     }
+
+    /// The ring's positions and flags, for the spike watchdog (any thread, racy).
+    [[nodiscard]] std::string DebugState() const;
 
     /// Whether the calling thread is the back.
     [[nodiscard]] static bool OnBackThread() {
@@ -162,9 +169,20 @@ public:
     void NoteWriter() {
         last_writer_position = write_position;
     }
+    /// A write to guest memory at `address` was just sent: a report or a semaphore release.
+    void NoteGuestWrite(GPUVAddr address) {
+        guest_writes[(address >> 4) % guest_writes.size()] = write_position;
+    }
+    /// Waits for the back to run the last noted writes to these bytes, if any is still queued.
+    bool WaitForGuestWrites(GPUVAddr address, size_t bytes, DrainSite site);
+    /// Whether compute or copy work sent so far is still queued (front thread only).
+    [[nodiscard]] bool WritersQueued() const {
+        return consumed.load(std::memory_order_acquire) <
+               (std::min)(last_writer_position, write_position);
+    }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -227,12 +245,7 @@ private:
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.
-    void NotifyFront() {
-        if (front_waiting.load(std::memory_order_seq_cst)) {
-            front_wake.fetch_add(1, std::memory_order_seq_cst);
-            front_wake.notify_one();
-        }
-    }
+    void NotifyFront();
 
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
@@ -245,6 +258,9 @@ private:
 
     // Front side.
     u64 write_position{};
+    /// By 16 byte block, hashed: where the last write to such a block was sent. A block that
+    /// shares its slot only makes the wait longer.
+    std::array<u64, 4096> guest_writes{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 published_local{};
@@ -274,6 +290,7 @@ private:
     /// The front sleeps in Backoff (#161: instead of yielding).
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
+    std::atomic<u64> last_front_wake_ns{}; ///< For EDEN_NX2_SPIKE_LOG
     std::jthread back_thread;
 };
 

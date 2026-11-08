@@ -535,6 +535,7 @@ public:
     void LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr);
 
     void InitializeInterfaces(KernelCore& kernel);
+    void PrecompileBlocks();
 
     Core::Memory::Memory& GetMemory() {
         return m_memory;

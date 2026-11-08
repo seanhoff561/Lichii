@@ -20,6 +20,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -76,6 +77,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    VideoCommon::Nx2Spike::Timer idle_timer{VideoCommon::Nx2Spike::Counter::FrontIdleNs};
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
@@ -86,6 +88,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                VideoCommon::Nx2Spike::Timer idle_timer{VideoCommon::Nx2Spike::Counter::FrontIdleNs};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {

@@ -140,7 +140,11 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
         return;
     }
     impl->context.emplace(*impl->decoder);
-    if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
+    // A decoder with no hardware configurations (libdav1d for AV1) decodes on the CPU whatever
+    // the setting: creating the GPU decode devices for it (CUDA, D3D11VA, ...) only cost ~0.5 s
+    // per movie in Ocarina and stalled the game's frame, which stopped its music.
+    if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu &&
+        avcodec_get_hw_config(impl->decoder->GetCodec(), 0) != nullptr) {
         impl->hardware.emplace();
         impl->hardware->InitializeForDecoder(*impl->context, *impl->decoder);
     }

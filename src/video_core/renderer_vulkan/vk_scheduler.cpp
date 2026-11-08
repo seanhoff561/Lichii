@@ -26,6 +26,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spike.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -309,6 +310,8 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    VideoCommon::Nx2Spike::Add(VideoCommon::Nx2Spike::Counter::Finishes);
+    VideoCommon::Nx2Spike::Timer spike_timer{VideoCommon::Nx2Spike::Counter::FinishNs};
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
