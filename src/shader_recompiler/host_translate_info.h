@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <initializer_list>
+
 #include "common/common_types.h"
 
 namespace Shader {
@@ -20,6 +22,7 @@ struct HostTranslateInfo {
     u64 min_ssbo_alignment{};            ///< Minimum alignment supported by the device for SSBOs
     u32 max_per_stage_descriptor_sampled_images{}; ///< maximum sampled descriptors per stage
     u32 max_per_stage_resources{};                 ///< maximum resources per stage
+    u32 max_per_stage_descriptor_storage_buffers{}; ///< maximum storage buffers per stage
     u32 max_descriptor_set_samplers{};
     u32 max_descriptor_set_uniform_buffers{};
     u32 max_descriptor_set_uniform_buffers_dynamic{};
@@ -42,12 +45,32 @@ struct HostTranslateInfo {
     bool single_lane_geometry_subgroups{};
     bool support_byte_addressed_r16{};
 
+    /// The properties that change which values translation reads from the environment, a bit
+    /// each: those deciding a pass that reads values, or a pass that changes the program before
+    /// one does. A disk cache record made where they differ can lack a value read here and still
+    /// hold every value read there. The descriptor limits decide which storage buffer passes run,
+    /// but each of those asks what the first one asked. A property that starts deciding such a pass
+    /// is added at the end, so that the bits of the others stay.
+    [[nodiscard]] u32 EnvironmentReadProperties() const noexcept {
+        u32 properties{};
+        u32 bit{1};
+        for (const bool property :
+             {support_float64, support_float16, support_int64, support_conditional_barrier,
+              needs_demote_reorder, support_geometry_shader_passthrough, support_viewport_mask,
+              single_lane_geometry_subgroups, support_snorm_render_buffer}) {
+            properties |= property ? bit : 0U;
+            bit <<= 1;
+        }
+        return properties;
+    }
+
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {
             min_ssbo_alignment = 1;
         }
         ApplyDescriptorLimitFallback(max_per_stage_descriptor_sampled_images);
         ApplyDescriptorLimitFallback(max_per_stage_resources);
+        ApplyDescriptorLimitFallback(max_per_stage_descriptor_storage_buffers);
         ApplyDescriptorLimitFallback(max_descriptor_set_samplers);
         ApplyDescriptorLimitFallback(max_descriptor_set_uniform_buffers);
         ApplyDescriptorLimitFallback(max_descriptor_set_uniform_buffers_dynamic);

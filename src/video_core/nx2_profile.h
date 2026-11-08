@@ -76,11 +76,12 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "writer wait", "list submit wait", "list GPU wait",
 };
 
-// Read at startup: Enabled() runs several times per method write (no guard to check).
-// Reload() reads it again once nx2_switches.txt is loaded (the GUI's main() sets it from there).
+// A plain flag: Enabled() runs several times per method write (no guard to check).
 inline bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 
-inline void Reload() {
+/// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
+/// nx2_switches.txt, so a switch set only there takes effect from that point on.
+inline void ReadSwitch() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
 }
 

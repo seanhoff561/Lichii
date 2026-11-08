@@ -40,6 +40,12 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 #endif
 
+// Unused space after the end of the stream buffer. Constant buffers are bound from it and the
+// shaders declare each one at its full 64 KiB, so Metal checks 64 KiB from the binding offset
+// against the end of the buffer ("argument c3[0] ... has space for 26624 bytes, but argument has a
+// length(65536)"). The tail is never handed out, so every binding has the full 64 KiB behind it.
+constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
+
 size_t GetStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
         if (device.IsIntegrated()) {
@@ -88,7 +94,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = stream_buffer_size,
+        .size = stream_buffer_size + STREAM_BUFFER_TAIL,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -225,7 +231,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .size = 1ULL << log2_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, // mesh emulation dispatch and draw arguments
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -286,6 +293,24 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
+
+    // Keep two idle upload buffers per level up to 32 MiB (under 128 MiB in all). Each level is
+    // swept every 64 frames, so after a pause each upload over 8 MiB (past the stream buffer's
+    // regions) got a new dedicated allocation, written to for the first time (16 MiB on an
+    // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
+    constexpr size_t KeepMaxLog2 = 25;
+    constexpr size_t KeepPerLevel = 2;
+    if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+        size_t idle = 0;
+        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        });
+        staging.delete_index = 0;
+        if (staging.iterate_index > entries.size()) {
+            staging.iterate_index = 0;
+        }
+        return;
+    }
 
     const auto is_deletable = [this, keep](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick + keep);

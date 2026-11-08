@@ -71,6 +71,10 @@ public:
     [[nodiscard]] bool Active() const {
         return active;
     }
+    /// How often the split started: state the front copied during an earlier start is stale.
+    [[nodiscard]] u32 Starts() const {
+        return starts;
+    }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
@@ -253,6 +257,7 @@ private:
 
     Core::System* system{};
     bool active{};
+    u32 starts{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 

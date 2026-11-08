@@ -269,6 +269,12 @@ const ShaderInfo* ShaderCache::ComputeShader() {
                                                      *kepler_compute, *gpu_memory, bank, offset);
                                              }))
             throw Shader::Ampere::TrapGuardError{};
+    } else if (kepler_compute->IsNativeMode() && IsRejected(*cpu_shader_addr)) {
+        // A rejected program fails the same way on every dispatch. GetGraphicsEnvironments
+        // skips those draws without rethrowing; doing the same here avoids two C++ throws, a
+        // mutex-guarded insert and an exception_ptr for each dispatch of the program. The
+        // caller already turns a missing shader into a failed dispatch.
+        return nullptr;
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
@@ -288,6 +294,10 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         DlssContract::IsFastFusionCandidate(program_id,
                                             shader->lowered_native->native_program_key)) {
         kepler_compute->TraceDlssContract(shader->lowered_native->native_program_key);
+    }
+    if (kepler_compute->IsNativeMode() && shader->lowered_native &&
+        kepler_compute->BypassOotNetwork(program_id, shader->lowered_native->native_program_key)) {
+        throw FireEmblemUpscale::DispatchReplaced{};
     }
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&
         kepler_compute->ProcessGameDlss(program_id, shader->lowered_native->native_program_key)) {
@@ -310,7 +320,13 @@ bool ShaderCache::IsRejected(VAddr addr) {
 
 void ShaderCache::RememberRejection(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
+    if (rejected_native.contains(addr)) {
+        // Called from a catch block: keep the first exception for that address instead of
+        // capturing and inserting a new one on every rejected dispatch.
+        return;
+    }
     rejected_native.emplace(addr, std::current_exception());
+    page_filter.Mark(addr, 1); // InnerInvalidation reaches InvalidatePagesInRegion for it
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
@@ -355,6 +371,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
 
     const VAddr addr_end = addr + size;
     Entry* const entry = NewEntry(addr, addr_end, data.get());
+    page_filter.Mark(addr, size);
 
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {

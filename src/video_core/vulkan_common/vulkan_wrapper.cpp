@@ -228,6 +228,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetMemoryWin32HandleKHR);
 #endif
     X(vkGetQueryPoolResults);
+    X(vkGetDeviceFaultInfoEXT);
     X(vkGetPipelineExecutablePropertiesKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
     X(vkGetSemaphoreCounterValue);
@@ -315,6 +316,7 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkDestroyDebugUtilsMessengerEXT);
     X(vkDestroyDebugReportCallbackEXT);
     X(vkDestroySurfaceKHR);
+    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetPhysicalDeviceFeatures2);
     X(vkGetPhysicalDeviceFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
@@ -323,7 +325,6 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
     X(vkGetPhysicalDeviceToolProperties);
-    X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetSwapchainImagesKHR);
     X(vkQueuePresentKHR);
 

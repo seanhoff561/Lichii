@@ -1349,7 +1349,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
-        maxwell3d.RefreshParameters();
+        // The parameters are the words the pusher fetched, as on the split front (FrontRunMacro):
+        // read again from guest memory, they are whatever reused that command memory since.
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
         static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
@@ -1435,8 +1436,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     // Accurate GPU mode holds report and semaphore writes in the query cache until a
-                    // fence: write them out, or occlusion predicates read stale values. With the split
-                    // the query cache belongs to its back: Maxwell3D::FrontDmaRead does this there.
+                    // fence: write them out, or occlusion predicates read stale values.
                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
                                              VideoCommon::GpuSplit::OnBackThread();
                     if (owns_caches && VideoCommon::QueryDma::TraceEnabled() &&
@@ -1445,8 +1445,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::QueryDma::Trace(memory, maxwell3d.Rasterizer(), method, address,
                                                      source, read_bytes);
                     }
-                    if (!VideoCommon::GpuSplit::Get().Active()) {
-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
+                    if (owns_caches) {
+                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
+                                                            read_bytes);
                     }
                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);

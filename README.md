@@ -16,9 +16,11 @@ Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator wri
 
 This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
 
+Visit the [official Lichii website](https://lichii.zortos.me) to find games and compare community compatibility reports.
+
 ## Downloads and setup
 
-Published builds belong on this fork's [releases page](https://github.com/zortos293/Eglantine/releases). The repository still uses its historical Eglantine name; the desktop application is now Lichii.
+Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
 
 On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
 
@@ -29,6 +31,12 @@ The rebrand intentionally retains the existing Eden/Eglantine data directories a
 ## Compatibility and issue reports
 
 Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
+
+Browse [community compatibility reports](https://lichii.zortos.me/reports) for results with each player's build and setup.
+
+Desktop reporting requires a build containing [PR #303](https://github.com/zortos293/Lichii/pull/303) and is not available in build 88. In builds that include it, play and stop a Switch 2 game, then right-click that game and choose **Submit compatibility report**. Only the latest session in the current Lichii process is eligible.
+
+Confirm the matching website catalog entry and review the editable machine, game, setup, and enabled add-on details prefilled where available. Check the public preview and give explicit consent before submitting. Nothing uploads automatically, and the native v1 reporter does not read or upload logs or files.
 
 When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
 

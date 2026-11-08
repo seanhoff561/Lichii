@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -123,6 +124,17 @@ public:
         std::unique_lock lock{shared->mutex};
         shared->condition.wait(lock,
                                [&] { return shared->complete.load(std::memory_order_acquire); });
+    }
+
+    /// Waits up to `timeout` for the build, without running it on this thread. The worker sets
+    /// `complete` under the mutex before notifying, so the wakeup cannot be lost.
+    /// @return True when the pipeline is built.
+    bool WaitFor(std::chrono::microseconds timeout) const {
+        const auto shared = state;
+        std::unique_lock lock{shared->mutex};
+        return shared->condition.wait_for(lock, timeout, [&] {
+            return shared->complete.load(std::memory_order_acquire);
+        });
     }
 
     PipelineBuild(const PipelineBuild&) = delete;

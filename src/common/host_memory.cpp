@@ -59,6 +59,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <random>
+#include <utility>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -79,7 +80,10 @@ static int memfd_create(const char* name, unsigned int flags) {
 
 namespace Common {
 
+thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
+
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
+[[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
 #ifdef _WIN32
@@ -137,6 +141,12 @@ public:
     {}
 
     bool Init() {
+        if (allocation_test_control) {
+            ++allocation_test_control->fastmem_attempts;
+            if (allocation_test_control->fail_fastmem) {
+                return false;
+            }
+        }
         if (!kernelbase_dll.IsOpen()) {
             LOG_CRITICAL(HW_Memory, "Failed to load Kernelbase.dll");
             return false;
@@ -151,8 +161,32 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Allocate backing file map. SEC_COMMIT charges all of it to the commit limit up front, and
+        // when the free commit is only just above its size the call fails with
+        // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
+        // runs the whole session without fastmem (Ocarina of Time: 20-25% fewer fps). A private
+        // commit of the same size does grow the page file, so make one, release it and try again.
+        for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
+            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+            if (backing_handle) {
+                if (attempt > 1) {
+                    LOG_INFO(HW_Memory, "Allocated {} MiB of backing memory on attempt {}", backing_size >> 20, attempt);
+                }
+                break;
+            }
+            const DWORD error = GetLastError();
+            MEMORYSTATUSEX status{};
+            status.dwLength = sizeof(status);
+            GlobalMemoryStatusEx(&status);
+            LOG_WARNING(HW_Memory, "Failed to allocate {} MiB of backing memory (attempt {}, error {}, {} MiB of commit free)",
+                        backing_size >> 20, attempt, error, status.ullAvailPageFile >> 20);
+            if (void* const probe = VirtualAlloc(nullptr, backing_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+                VirtualFree(probe, 0, MEM_RELEASE);
+            }
+            if (attempt < BackingAttempts) {
+                Sleep(50);
+            }
+        }
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;
@@ -186,6 +220,12 @@ public:
     }
 
     void* Allocate(size_t size) {
+        if (allocation_test_control) {
+            ++allocation_test_control->fallback_attempts;
+            if (allocation_test_control->fail_fallback) {
+                return nullptr;
+            }
+        }
         auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (ptr == nullptr) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, error {}", size, GetLastError());
@@ -265,6 +305,7 @@ private:
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
+            virtual_base = nullptr;
         }
         if (backing_base) {
             if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
@@ -273,9 +314,13 @@ private:
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
             }
+            backing_base = nullptr;
         }
-        if (!CloseHandle(backing_handle)) {
-            LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+        if (backing_handle && backing_handle != INVALID_HANDLE_VALUE) {
+            if (!CloseHandle(backing_handle)) {
+                LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+            }
+            backing_handle = nullptr;
         }
     }
 
@@ -534,6 +579,12 @@ public:
 
     bool Init() {
         const long page_size = sysconf(_SC_PAGESIZE);
+        if (allocation_test_control) {
+            ++allocation_test_control->fastmem_attempts;
+            if (allocation_test_control->fail_fastmem) {
+                return false;
+            }
+        }
         if (page_size < static_cast<long>(PageAlignment) ||
             page_size % static_cast<long>(PageAlignment) != 0) {
             LOG_WARNING(Common_Memory, "Host page size {:#x} does not support fastmem", page_size);
@@ -640,9 +691,16 @@ public:
     }
 
     void* Allocate(size_t size) {
+        if (allocation_test_control) {
+            ++allocation_test_control->fallback_attempts;
+            if (allocation_test_control->fail_fallback) {
+                return nullptr;
+            }
+        }
         auto* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (ptr == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, {}", size, strerror(errno));
+            return nullptr;
         }
         return ptr;
     }
@@ -907,14 +965,23 @@ private:
 #endif // ^^^ POSIX ^^^
 
 HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
-    : backing_size(backing_size_)
-    , virtual_size(virtual_size_)
-    , num_granules(Common::DivCeil(backing_size_, size_t{1} << GranuleShift))
+    : backing_size(allocation_test_control ? allocation_test_control->backing_size : backing_size_)
+    , virtual_size(allocation_test_control ? allocation_test_control->virtual_size : virtual_size_)
+    , num_granules(Common::DivCeil(backing_size, size_t{1} << GranuleShift))
 {
     granules = std::make_unique<std::atomic<u8>[]>(num_granules);
 #if defined(__OPENORBIS__) || defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
-    backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (allocation_test_control) {
+        ++allocation_test_control->fallback_attempts;
+    }
+    if (!allocation_test_control || !allocation_test_control->fail_fallback) {
+        backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (backing_base == MAP_FAILED) {
+            backing_base = nullptr;
+        }
+    }
+    fallback_buffer = true;
     virtual_base = nullptr;
 #else
     // Try to allocate a fastmem arena.
@@ -939,19 +1006,39 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
 
 HostMemory::~HostMemory() {
 #ifdef _WIN32
-    if (fallback_buffer) {
-        VirtualFree(backing_base, backing_size, MEM_RELEASE);
+    if (fallback_buffer && backing_base) {
+        VirtualFree(backing_base, 0, MEM_RELEASE);
     }
 #else
-    if (fallback_buffer) {
+    if (fallback_buffer && backing_base) {
         munmap(backing_base, backing_size);
     }
 #endif
 }
 
-HostMemory::HostMemory(HostMemory&&) noexcept = default;
+HostMemory::HostMemory(HostMemory&& other) noexcept {
+    Swap(other);
+}
 
-HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+HostMemory& HostMemory::operator=(HostMemory&& other) noexcept {
+    HostMemory replacement{std::move(other)};
+    Swap(replacement);
+    return *this;
+}
+
+void HostMemory::Swap(HostMemory& other) noexcept {
+    std::swap(backing_size, other.backing_size);
+    std::swap(virtual_size, other.virtual_size);
+#if !(defined(__OPENORBIS__) || defined(__managarm__))
+    std::swap(impl, other.impl);
+#endif
+    std::swap(backing_base, other.backing_base);
+    std::swap(virtual_base, other.virtual_base);
+    std::swap(virtual_base_offset, other.virtual_base_offset);
+    std::swap(granules, other.granules);
+    std::swap(num_granules, other.num_granules);
+    std::swap(fallback_buffer, other.fallback_buffer);
+}
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
@@ -1036,8 +1123,10 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.
         VirtualUnlock(address, length);
-#elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
+#elif defined(__linux__) && defined(MADV_COLD)
+        // MADV_COLD only deactivates the pages, like VirtualUnlock. MADV_PAGEOUT writes them to
+        // swap right away while holding the mmap lock, which stalled every guest core for 3-15 s.
+        madvise(address, length, MADV_COLD);
 #else
         static_cast<void>(address);
 #endif

@@ -178,6 +178,8 @@ struct InstanceDispatch {
     PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties{};
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices{};
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr{};
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR{};
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2{};
     PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2{};
@@ -186,8 +188,6 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties{};
     PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2{};
     PFN_vkGetPhysicalDeviceToolProperties vkGetPhysicalDeviceToolProperties{};
-    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
-        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR{};
     PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties{};
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR{};
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR{};
@@ -345,6 +345,7 @@ struct DeviceDispatch : InstanceDispatch {
 #ifdef _WIN32
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR{};
 #endif
+    PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT{};
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
@@ -1222,7 +1223,7 @@ public:
 
     std::vector<VkPhysicalDeviceToolProperties> GetPhysicalDeviceToolProperties() const;
 
-    /// Matrix shapes and types VK_KHR_cooperative_matrix supports (empty without it).
+    /// Matrix shapes and types of VK_KHR_cooperative_matrix; empty when the driver lacks it.
     std::vector<VkCooperativeMatrixPropertiesKHR> GetCooperativeMatrixPropertiesKHR() const;
 
     bool GetSurfaceSupportKHR(u32 queue_family_index, VkSurfaceKHR) const;

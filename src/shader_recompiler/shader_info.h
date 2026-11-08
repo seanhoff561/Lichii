@@ -15,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/type.h"
+#include "shader_recompiler/storage_write_extent.h"
 #include "shader_recompiler/varying_state.h"
 
 #include <boost/container/small_vector.hpp>
@@ -178,6 +179,8 @@ struct StorageBufferDescriptor {
     /// When not ~0, the constant buffer word points to a table and the buffer pointer is stored
     /// at this byte offset into it
     u32 indirect_offset{~0U};
+    /// How far the program's stores reach past the pointer (unbounded unless proven)
+    StorageWriteExtent write_extent{};
 
     [[nodiscard]] bool IsIndirect() const noexcept {
         return indirect_offset != ~0U;
@@ -277,12 +280,19 @@ struct MeshInfo {
     }
     boost::container::static_vector<u32, 136> vertex_lines;
     boost::container::static_vector<u32, 136> primitive_lines;
+
+    /// Vertex indices per primitive, which is also its byte count in the map region.
+    [[nodiscard]] u32 PrimitiveVertices() const noexcept {
+        return topology == 0 ? 1 : topology == 1 ? 2 : 3;
+    }
 };
 
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
-    static constexpr size_t MAX_SSBOS{32};
+    /// Native (Switch 2) programs take their storage buffers from raw pointers, as many as they
+    /// read: Ocarina of Time's foliage culling binds 37 for its lists and per-type instance tables.
+    static constexpr size_t MAX_SSBOS{64};
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
@@ -307,6 +317,8 @@ struct Info {
     bool loads_indexed_attributes{};
 
     std::array<bool, 8> stores_frag_color{};
+    /// Components (bit 0 = R ... bit 3 = A) of each render target the fragment shader writes
+    std::array<u8, 8> frag_color_components{};
     bool stores_sample_mask{};
     bool stores_frag_depth{};
 
@@ -355,6 +367,8 @@ struct Info {
     bool uses_global_memory{};
     bool requires_coherent_global_memory{};
     bool requires_coherent_image_memory{};
+    /// Set by the SPIR-V backend when HMMA runs on cooperative matrices, which need full subgroups
+    bool uses_cooperative_matrix{};
     /// Native global accesses whose pointer is chosen at run time: every storage buffer descriptor
     /// is a candidate and its bound length (not an NVN size word) limits the range.
     bool native_global_bounds{};

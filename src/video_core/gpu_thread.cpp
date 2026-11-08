@@ -7,6 +7,12 @@
 #include <chrono>
 #include <thread>
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#elif defined(_WIN32)
+#include "common/windows/timer_resolution.h"
+#endif
+
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/scope_exit.h"
@@ -52,9 +58,15 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
+#ifdef __linux__
+        // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
+        prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+#endif
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
-        Common::ReserveCoreForCurrentThread();
+        if (Settings::values.pin_gpu_threads.GetValue()) {
+            Common::PinCurrentThread(Common::PinnedRole::GpuFront);
+        }
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();
@@ -68,19 +80,36 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
-                    scheduler.ResumePending(system.GPU());
+                    resumed = scheduler.ResumePending(system.GPU());
+                }
+                if (resumed) {
+                    last_progress = std::chrono::steady_clock::now();
                 }
                 if (!state.queue.TryPop(next)) {
+                    if (!scheduler.HasPendingChannels()) {
+                        continue;
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
+                    // second and its present waits for the work behind them: with 1 ms sleeps the
+                    // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
+                    // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     VideoCommon::Nx2Spike::Timer idle_timer{VideoCommon::Nx2Spike::Counter::FrontIdleNs};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    const auto waited = std::chrono::steady_clock::now() - last_progress;
+                    if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
+                    } else if (waited < std::chrono::seconds{2}) {
+#ifdef _WIN32
+                        // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
+                        // SleepForOneTick uses NtDelayExecution(-1) for one high-res timer tick.
+                        Common::Windows::SleepForOneTick();
+#else
+                        std::this_thread::sleep_for(std::chrono::microseconds{50});
+#endif
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
@@ -94,7 +123,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (stop_token.stop_requested()) {
                 break;
             }
-            last_progress = std::chrono::steady_clock::now();
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
@@ -127,6 +155,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     SignalCommand(*state_ptr, fence, block);
                 });
                 split.Publish();
+                last_progress = std::chrono::steady_clock::now();
                 continue;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
@@ -148,6 +177,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 ASSERT(false);
             }
             SignalCommand(state, next.fence, next.block);
+            last_progress = std::chrono::steady_clock::now();
         }
     });
 }

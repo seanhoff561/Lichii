@@ -378,10 +378,10 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
         result = ctx.OpFAdd(value_type, op_a, op_b);
         break;
     case Operation::FPMin:
-        result = ctx.OpFMin(value_type, op_a, op_b);
+        result = ctx.OpNMin(value_type, op_a, op_b);
         break;
     case Operation::FPMax:
-        result = ctx.OpFMax(value_type, op_a, op_b);
+        result = ctx.OpNMax(value_type, op_a, op_b);
         break;
     default:
         break;
@@ -392,7 +392,7 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
 }
 
 Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_pointer,
-           Id value_type, Id memory_type, spv::Scope scope) {
+           Id value_type, spv::Scope scope) {
     const bool is_shared{scope == spv::Scope::Workgroup};
     const bool is_struct{!is_shared || ctx.uses_explicit_workgroup_layout};
     const Id cas_func{CasFunction(ctx, operation, value_type)};
@@ -411,6 +411,13 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
     const Id op_b{ctx.OpFunctionParameter(value_type)};
     const Id base{is_shared ? ctx.shared_memory_u32 : ctx.OpFunctionParameter(array_pointer)};
     ctx.AddLabel();
+    // Each attempt expects the word the previous compare-exchange returned. A plain reload can
+    // keep returning a stale copy (AMD), and the invocations that lost would never match again.
+    const Id expected_var{ctx.AddLocalVariable(
+        ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]), spv::StorageClass::Function)};
+    const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
+                                    : ctx.OpAccessChain(element_pointer, base, index)};
+    ctx.OpStore(expected_var, ctx.OpLoad(ctx.U32[1], word_pointer));
     ctx.OpBranch(loop_header);
     ctx.AddLabel(loop_header);
 
@@ -418,34 +425,28 @@ Id CasLoop(EmitContext& ctx, Operation operation, Id array_pointer, Id element_p
     ctx.OpBranch(continue_block);
 
     ctx.AddLabel(continue_block);
-    const Id word_pointer{is_struct ? ctx.OpAccessChain(element_pointer, base, zero, index)
-                                    : ctx.OpAccessChain(element_pointer, base, index)};
-    if (value_type.value == ctx.F32[2].value) {
-        const Id u32_value{ctx.OpLoad(ctx.U32[1], word_pointer)};
-        const Id value{ctx.OpUnpackHalf2x16(ctx.F32[2], u32_value)};
-        const Id new_value{ctx.OpFunctionCall(value_type, cas_func, value, op_b)};
-        const Id u32_new_value{ctx.OpPackHalf2x16(ctx.U32[1], new_value)};
-        const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero,
-                                                        zero, u32_new_value, u32_value)};
-        const Id success{ctx.OpIEqual(ctx.U1, atomic_res, u32_value)};
-        ctx.OpBranchConditional(success, merge_block, loop_header);
+    // The word holds a u32, an f32, an f16x2, or an f32x2 packed as two halves.
+    const bool packed_half{value_type.value == ctx.F32[2].value};
+    const bool is_u32{value_type.value == ctx.U32[1].value};
+    const auto from_word{[&](Id word) {
+        if (packed_half) {
+            return ctx.OpUnpackHalf2x16(ctx.F32[2], word);
+        }
+        return is_u32 ? word : ctx.OpBitcast(value_type, word);
+    }};
+    const Id expected{ctx.OpLoad(ctx.U32[1], expected_var)};
+    const Id new_value{ctx.OpFunctionCall(value_type, cas_func, from_word(expected), op_b)};
+    const Id new_word{packed_half ? ctx.OpPackHalf2x16(ctx.U32[1], new_value)
+                      : is_u32    ? new_value
+                                  : ctx.OpBitcast(ctx.U32[1], new_value)};
+    const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero, zero,
+                                                    new_word, expected)};
+    ctx.OpStore(expected_var, atomic_res);
+    const Id success{ctx.OpIEqual(ctx.U1, atomic_res, expected)};
+    ctx.OpBranchConditional(success, merge_block, loop_header);
 
-        ctx.AddLabel(merge_block);
-        ctx.OpReturnValue(ctx.OpUnpackHalf2x16(ctx.F32[2], atomic_res));
-    } else {
-        const Id value{ctx.OpLoad(memory_type, word_pointer)};
-        const bool matching_type{value_type.value == memory_type.value};
-        const Id bitcast_value{matching_type ? value : ctx.OpBitcast(value_type, value)};
-        const Id cal_res{ctx.OpFunctionCall(value_type, cas_func, bitcast_value, op_b)};
-        const Id new_value{matching_type ? cal_res : ctx.OpBitcast(memory_type, cal_res)};
-        const Id atomic_res{ctx.OpAtomicCompareExchange(ctx.U32[1], word_pointer, scope_id, zero,
-                                                        zero, new_value, value)};
-        const Id success{ctx.OpIEqual(ctx.U1, atomic_res, value)};
-        ctx.OpBranchConditional(success, merge_block, loop_header);
-
-        ctx.AddLabel(merge_block);
-        ctx.OpReturnValue(ctx.OpBitcast(value_type, atomic_res));
-    }
+    ctx.AddLabel(merge_block);
+    ctx.OpReturnValue(from_word(atomic_res));
     ctx.OpFunctionEnd();
     return func;
 }
@@ -514,6 +515,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program);
+    DefineMeshEmulationOutput();
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
 }
@@ -688,22 +690,26 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         const Id offset{OpFunctionParameter(U32[1])};
         const Id insert_value{OpFunctionParameter(U32[1])};
         AddLabel();
-        OpBranch(loop_header);
-
-        AddLabel(loop_header);
+        const Id expected_var{AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]),
+                                               spv::StorageClass::Function)};
         const Id word_offset{OpShiftRightArithmetic(U32[1], offset, Const(2U))};
         const Id shift_offset{OpShiftLeftLogical(U32[1], offset, Const(3U))};
         const Id bit_offset{OpBitwiseAnd(U32[1], shift_offset, Const(mask))};
         const Id count{Const(size)};
+        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
+        OpStore(expected_var, OpLoad(U32[1], word_pointer));
+        OpBranch(loop_header);
+
+        AddLabel(loop_header);
         OpLoopMerge(merge_block, continue_block, spv::LoopControlMask::MaskNone);
         OpBranch(continue_block);
 
         AddLabel(continue_block);
-        const Id word_pointer{OpAccessChain(shared_u32, shared_memory_u32, word_offset)};
-        const Id old_value{OpLoad(U32[1], word_pointer)};
+        const Id old_value{OpLoad(U32[1], expected_var)};
         const Id new_value{OpBitFieldInsert(U32[1], old_value, insert_value, bit_offset, count)};
         const Id atomic_res{OpAtomicCompareExchange(U32[1], word_pointer, Const(1U), u32_zero_value,
                                                     u32_zero_value, new_value, old_value)};
+        OpStore(expected_var, atomic_res);
         const Id success{OpIEqual(U1, atomic_res, old_value)};
         OpBranchConditional(success, merge_block, loop_header);
 
@@ -723,11 +729,11 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
 void EmitContext::DefineSharedMemoryFunctions(const IR::Program& program) {
     if (program.info.uses_shared_increment) {
         increment_cas_shared = CasLoop(*this, Operation::Increment, shared_memory_u32_type,
-                                       shared_u32, U32[1], U32[1], spv::Scope::Workgroup);
+                                       shared_u32, U32[1], spv::Scope::Workgroup);
     }
     if (program.info.uses_shared_decrement) {
         decrement_cas_shared = CasLoop(*this, Operation::Decrement, shared_memory_u32_type,
-                                       shared_u32, U32[1], U32[1], spv::Scope::Workgroup);
+                                       shared_u32, U32[1], spv::Scope::Workgroup);
     }
 }
 
@@ -937,6 +943,10 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     const Id bit_count{OpFunctionParameter(U32[1])};
 
     AddLabel();
+    // Each attempt expects the word the previous compare-exchange returned (see CasLoop).
+    const Id expected_var{
+        AddLocalVariable(TypePointer(spv::StorageClass::Function, U32[1]), spv::StorageClass::Function)};
+    OpStore(expected_var, OpLoad(U32[1], pointer));
     const Id scope_device{Const(1u)};
     const Id ordering_relaxed{u32_zero_value};
     const Id body_label{OpLabel()};
@@ -950,10 +960,11 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     OpBranch(body_label);
 
     AddLabel(body_label);
-    const Id expected_value{OpLoad(U32[1], pointer)};
+    const Id expected_value{OpLoad(U32[1], expected_var)};
     const Id desired_value{OpBitFieldInsert(U32[1], expected_value, value, bit_offset, bit_count)};
     const Id actual_value{OpAtomicCompareExchange(U32[1], pointer, scope_device, ordering_relaxed,
                                                   ordering_relaxed, desired_value, expected_value)};
+    OpStore(expected_var, actual_value);
     const Id store_successful{OpIEqual(U1, expected_value, actual_value)};
     OpBranchConditional(store_successful, endloop_label, continue_label);
 
@@ -1024,7 +1035,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
-            callback(ssbo_pointer);
+            callback(ssbo_pointer, ssbo_id, ssbo_index);
             AddLabel(else_label);
         }};
         if (info.native_global_bounds) {
@@ -1078,8 +1089,30 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
+        // Buffers are bound at the device's storage buffer alignment (4 bytes on AMD), so an
+        // aligned 8 or 16 byte guest access can start at any word of the binding and the vector
+        // view (offset >> shift) would read the vector before it. Those accesses read the words
+        // of the buffer found for the address.
+        if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
+            const u32 count = 1U << (shift - 2);
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id, Id ssbo_id, Id word_index) {
+                            std::array<Id, 4> words;
+                            for (u32 i = 0; i < count; ++i) {
+                                const Id index{i == 0 ? word_index
+                                                      : OpIAdd(U32[1], word_index, Const(i))};
+                                words[i] = OpLoad(U32[1], OpAccessChain(storage_types.U32.element,
+                                                                         ssbo_id, zero, index));
+                            }
+                            OpReturnValue(
+                                OpCompositeConstruct(type, std::span{words}.first(count)));
+                        });
+            OpReturnValue(ConstantNull(type));
+            OpFunctionEnd();
+            return func_id;
+        }
         define_body(ssbo_member, addr, element_pointer, shift,
-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
+                    [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
@@ -1101,7 +1134,24 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+        if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
+            const u32 count = 1U << (shift - 2);
+            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        [&](Id, Id ssbo_id, Id word_index) {
+                            for (u32 i = 0; i < count; ++i) {
+                                const Id index{i == 0 ? word_index
+                                                      : OpIAdd(U32[1], word_index, Const(i))};
+                                OpStore(OpAccessChain(storage_types.U32.element, ssbo_id, zero,
+                                                      index),
+                                        OpCompositeExtract(U32[1], data, i));
+                            }
+                            OpReturn();
+                        });
+            OpReturn();
+            OpFunctionEnd();
+            return func_id;
+        }
+        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
             OpStore(ssbo_pointer, data);
             OpReturn();
         });
@@ -1129,32 +1179,75 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         })) {
         return;
     }
-    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
-        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
-                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
-                    return inst.GetOpcode() == opcode;
-                });
-            })) {
+    // Atomics the storage buffer pass could not track: the same routing, with the operation on
+    // the routed word (INC, DEC and F32 add through their storage buffer CAS loops).
+    using enum GlobalAtomic;
+    const auto kind_of = [](IR::Opcode opcode) -> std::optional<GlobalAtomic> {
+        switch (opcode) {
+        case IR::Opcode::GlobalAtomicIAdd32: return IAdd;
+        case IR::Opcode::GlobalAtomicSMin32: return SMin;
+        case IR::Opcode::GlobalAtomicUMin32: return UMin;
+        case IR::Opcode::GlobalAtomicSMax32: return SMax;
+        case IR::Opcode::GlobalAtomicUMax32: return UMax;
+        case IR::Opcode::GlobalAtomicInc32: return Inc;
+        case IR::Opcode::GlobalAtomicDec32: return Dec;
+        case IR::Opcode::GlobalAtomicAnd32: return And;
+        case IR::Opcode::GlobalAtomicOr32: return Or;
+        case IR::Opcode::GlobalAtomicXor32: return Xor;
+        case IR::Opcode::GlobalAtomicExchange32: return Exchange;
+        case IR::Opcode::GlobalAtomicAddF32: return AddF32;
+        default: return std::nullopt;
+        }
+    };
+    std::array<bool, static_cast<size_t>(Count)> used{};
+    for (const IR::Block* const block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (const auto kind = kind_of(inst.GetOpcode())) {
+                used[static_cast<size_t>(*kind)] = true;
+            }
+        }
+    }
+    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+    for (size_t index = 0; index < used.size(); ++index) {
+        if (!used[index]) {
             continue;
         }
-        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
-        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
-            atomic_add_global_func_u32 = function;
-        } else {
-            atomic_umax_global_func_u32 = function;
-        }
-        const Id address{OpFunctionParameter(U64)};
-        const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer) {
-                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
-                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
-                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
+        const auto kind = static_cast<GlobalAtomic>(index);
+        const Id type{kind == AddF32 ? F32[1] : U32[1]};
+        const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone,
+                                    TypeFunction(type, U64, type))};
+        const Id addr{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(type)};
+        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                    [&](Id pointer, Id ssbo, Id word) {
+                        const auto atomic = [&](Id (Sirit::Module::*op)(Id, Id, Id, Id, Id)) {
+                            return (this->*op)(U32[1], pointer, scope, zero, value);
+                        };
+                        switch (kind) {
+                        case IAdd: OpReturnValue(atomic(&Sirit::Module::OpAtomicIAdd)); break;
+                        case SMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMin)); break;
+                        case UMin: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMin)); break;
+                        case SMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicSMax)); break;
+                        case UMax: OpReturnValue(atomic(&Sirit::Module::OpAtomicUMax)); break;
+                        case And: OpReturnValue(atomic(&Sirit::Module::OpAtomicAnd)); break;
+                        case Or: OpReturnValue(atomic(&Sirit::Module::OpAtomicOr)); break;
+                        case Xor: OpReturnValue(atomic(&Sirit::Module::OpAtomicXor)); break;
+                        case Exchange: OpReturnValue(atomic(&Sirit::Module::OpAtomicExchange)); break;
+                        case Inc:
+                            OpReturnValue(OpFunctionCall(U32[1], increment_cas_ssbo, word, value, ssbo));
+                            break;
+                        case Dec:
+                            OpReturnValue(OpFunctionCall(U32[1], decrement_cas_ssbo, word, value, ssbo));
+                            break;
+                        case AddF32:
+                            OpReturnValue(OpFunctionCall(F32[1], f32_add_cas, word, value, ssbo));
+                            break;
+                        case Count: break;
+                        }
                     });
-        OpReturnValue(u32_zero_value);
+        OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
+        global_atomic_funcs[index] = func_id;
     }
     if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
             return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
@@ -1167,9 +1260,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id address{OpFunctionParameter(U64)};
         const Id comparator{OpFunctionParameter(U32[1])};
         const Id value{OpFunctionParameter(U32[1])};
-        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer) {
+                    [&](Id pointer, Id, Id) {
                         OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
                                                               u32_zero_value, u32_zero_value,
                                                               value, comparator));
@@ -1443,39 +1535,39 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
     if (info.uses_global_increment) {
         increment_cas_ssbo = CasLoop(*this, Operation::Increment, storage_types.U32.array,
-                                     storage_types.U32.element, U32[1], U32[1], spv::Scope::Device);
+                                     storage_types.U32.element, U32[1], spv::Scope::Device);
     }
     if (info.uses_global_decrement) {
         decrement_cas_ssbo = CasLoop(*this, Operation::Decrement, storage_types.U32.array,
-                                     storage_types.U32.element, U32[1], U32[1], spv::Scope::Device);
+                                     storage_types.U32.element, U32[1], spv::Scope::Device);
     }
     if (info.uses_atomic_f32_add) {
         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                              storage_types.U32.element, F32[1], U32[1], spv::Scope::Device);
+                              storage_types.U32.element, F32[1], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_add) {
         f16x2_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_min) {
         f16x2_min_cas = CasLoop(*this, Operation::FPMin, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f16x2_max) {
         f16x2_max_cas = CasLoop(*this, Operation::FPMax, storage_types.U32.array,
-                                storage_types.U32.element, F16[2], F16[2], spv::Scope::Device);
+                                storage_types.U32.element, F16[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_add) {
         f32x2_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_min) {
         f32x2_min_cas = CasLoop(*this, Operation::FPMin, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
     if (info.uses_atomic_f32x2_max) {
         f32x2_max_cas = CasLoop(*this, Operation::FPMax, storage_types.U32.array,
-                                storage_types.U32.element, F32[2], F32[2], spv::Scope::Device);
+                                storage_types.U32.element, F32[2], spv::Scope::Device);
     }
 }
 
@@ -1621,7 +1713,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if (info.uses_is_helper_invocation) {
         is_helper_invocation = DefineInput(*this, U1, false, spv::BuiltIn::HelperInvocation);
     }
-    if (info.uses_subgroup_mask && profile.SupportsSubgroupStage(stage)) {
+    if (info.uses_subgroup_mask && SupportsSubgroups()) {
         subgroup_mask_eq = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupEqMaskKHR);
         subgroup_mask_lt = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLtMaskKHR);
         subgroup_mask_le = DefineInput(*this, U32[4], false, spv::BuiltIn::SubgroupLeMaskKHR);
@@ -1638,7 +1730,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
     if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
          (profile.warp_size_potentially_larger_than_guest &&
           (info.uses_subgroup_vote || info.uses_subgroup_mask))) &&
-        profile.SupportsSubgroupStage(stage)) {
+        SupportsSubgroups()) {
         AddCapability(spv::Capability::GroupNonUniform);
         subgroup_local_invocation_id =
             DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupLocalInvocationId);
@@ -1667,8 +1759,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
+    const bool noperspective_as_smooth{
+        stage == Stage::Fragment && runtime_info.scaled_noperspective_inputs &&
+        std::ranges::any_of(info.interpolation, [](Interpolation mode) {
+            return mode == Interpolation::NoPerspective;
+        })};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1778,7 +1875,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                // The previous stage may write it times Position.w (noperspective_outputs).
+                if (!runtime_info.scaled_noperspective_inputs) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                } else {
+                    noperspective_as_smooth_inputs[index] = true;
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);
@@ -1803,16 +1905,22 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
+    // Mesh emulation: a compute shader with the same workgroup memory, writing a storage buffer.
+    const bool as_compute{runtime_info.mesh_as_compute};
+    if (!as_compute) {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
-    // The task's output region, which its mesh workgroups read as their input region.
-    const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
+    // The task's output region, which its mesh workgroups read as their input region. In the
+    // emulation it is plain workgroup memory, copied through the task payload buffer.
+    const spv::StorageClass payload_class{as_compute ? spv::StorageClass::Workgroup
+                                                     : spv::StorageClass::TaskPayloadWorkgroupEXT};
+    const Id payload_type{TypeArray(U32[1], Const((std::max)(mesh_info.payload_words, 1U)))};
+    mesh_payload = DefineVariable(*this, payload_type, std::nullopt, payload_class);
     Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+    mesh_payload_u32 = TypePointer(payload_class, U32[1]);
     if (stage == Stage::Task) {
         return;
     }
@@ -1824,7 +1932,7 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
+    mesh_map_bytes = 4 + mesh_info.PrimitiveVertices() * mesh_info.max_primitives;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -1836,17 +1944,26 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
 
+    if (as_compute) {
+        return; // the output buffer: DefineMeshEmulationOutput, after the storage buffers
+    }
+
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
-    const u32 indices_per_primitive{mesh_info.IndicesPerPrimitive()};
+    const u32 primitive_vertices{mesh_info.PrimitiveVertices()};
     mesh_primitive_indices = DefineVariable(
-        *this, TypeArray(U32[indices_per_primitive], primitive_count),
-        indices_per_primitive == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
-        : indices_per_primitive == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
-                                     : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
+        *this, TypeArray(U32[primitive_vertices], primitive_count),
+        primitive_vertices == 1   ? spv::BuiltIn::PrimitivePointIndicesEXT
+        : primitive_vertices == 2 ? spv::BuiltIn::PrimitiveLineIndicesEXT
+                                  : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
         spv::StorageClass::Output);
     std::array<Id, IR::NUM_GENERICS> generics[2]{};
-    Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    Id& point_size{mesh_point_size};
+    Id primitive_layer{}, primitive_viewport{}, primitive_id_output{};
+    if (primitive_vertices == 1) {
+        point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count), spv::BuiltIn::PointSize,
+                                    spv::StorageClass::Output);
+    }
     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
         if (!Sirit::ValidId(variable)) {
             variable = DefineVariable(*this, TypeArray(U32[1], primitive_count), builtin,
@@ -1911,10 +2028,57 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
-    // Points need a size; a program that writes none gets 1.0 (the hardware default).
-    if (indices_per_primitive == 1 && !Sirit::ValidId(point_size)) {
-        mesh_point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count),
-                                         spv::BuiltIn::PointSize, spv::StorageClass::Output);
+}
+
+void EmitContext::DefineMeshEmulationOutput() {
+    if ((stage != Stage::Mesh && stage != Stage::Task) || !runtime_info.mesh_as_compute) {
+        return;
+    }
+    // u32 arrays: the output MeshEpilogue writes each workgroup's block to
+    // (EmitMeshEmulationVertex) and the task payload, offset and argument buffers (RuntimeInfo).
+    // Sirit shares identical types, so reuse the u32 storage buffer type when the program's own
+    // storage buffers declared it: decorating it again would be invalid SPIR-V.
+    AddExtension("SPV_KHR_storage_buffer_storage_class");
+    Id struct_pointer{storage_types.U32.array};
+    if (!Sirit::ValidId(struct_pointer)) {
+        const Id array_type{TypeRuntimeArray(U32[1])};
+        Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id struct_type{TypeStruct(array_type)};
+        Decorate(struct_type, spv::Decoration::Block);
+        MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+        struct_pointer = TypePointer(spv::StorageClass::StorageBuffer, struct_type);
+    }
+    const auto define = [&](u32 binding, std::string_view name) {
+        const Id buffer{AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
+        Decorate(buffer, spv::Decoration::Binding, binding);
+        Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
+        Name(buffer, name);
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(buffer);
+        }
+        return buffer;
+    };
+    mesh_output_u32 = TypePointer(spv::StorageClass::StorageBuffer, U32[1]);
+    const bool has_task{runtime_info.mesh_task_payload_binding != ~0U};
+    if (has_task) {
+        mesh_task_payload_buffer =
+            define(runtime_info.mesh_task_payload_binding, "mesh_emulation_task_payload");
+    }
+    if (stage == Stage::Task) {
+        return;
+    }
+    mesh_output_buffer = define(runtime_info.mesh_output_binding, "mesh_emulation_output");
+    if (has_task) {
+        mesh_task_offsets_buffer =
+            define(runtime_info.mesh_task_offsets_binding, "mesh_emulation_task_offsets");
+        mesh_task_args_buffer =
+            define(runtime_info.mesh_task_args_binding, "mesh_emulation_task_args");
+        mesh_group_index = AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]),
+                                             spv::StorageClass::Private);
+        Name(mesh_group_index, "mesh_group_index");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(mesh_group_index);
+        }
     }
 }
 

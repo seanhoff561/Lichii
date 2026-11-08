@@ -55,9 +55,9 @@ struct Submission {
 
 class FenceManager final : public VideoCommon::FenceManager<Traits> {
 public:
-    FenceManager(VideoCore::RasterizerInterface& rasterizer, Tegra::GPU& gpu, Cache& texture,
+    FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::GPU& gpu_, Cache& texture,
                  Cache& buffer, Cache& query, Submission& submission_)
-        : VideoCommon::FenceManager<Traits>{rasterizer, gpu, texture, buffer, query},
+        : VideoCommon::FenceManager<Traits>{rasterizer_, gpu_, texture, buffer, query},
           submission{submission_} {}
 
     u64 queued{};

@@ -115,7 +115,7 @@ if (MSVC AND NOT CXX_CLANG)
         /we4457 # Declaration of 'identifier' hides function parameter
         /we4458 # Declaration of 'identifier' hides class member
         /we4459 # Declaration of 'identifier' hides global declaration
-        /w4505 # 'function': unreferenced local function has been removed
+        /w44505 # 'function': unreferenced local function has been removed
         /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
         /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
         /we4555 # Expression has no effect; expected expression with side-effect
@@ -228,6 +228,13 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-stringop-overflow>)
     endif()
 
+    # GCC 13+ unswitches loops on switch statements and can drop cases from the unswitched copy
+    # (same pass as https://gcc.gnu.org/PR128356). It dropped the split front's macro uploads
+    # in Maxwell3D::FrontCallMultiMethod, so games using macros showed a black screen (#500).
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13" AND CXX_GCC)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fno-unswitch-loops>)
+    endif()
+
     # Set file offset size to 64 bits.
     #
     # On modern Unixes, this is typically already the case. The lone exception is
@@ -300,6 +307,9 @@ endif()
 if (ENABLE_QT)
     add_subdirectory(qt_common)
     add_subdirectory(yuzu)
+    if (WIN32 AND ENABLE_UPDATE_CHECKER)
+        add_subdirectory(updater)
+    endif()
 endif()
 
 if (ENABLE_WEB_SERVICE)

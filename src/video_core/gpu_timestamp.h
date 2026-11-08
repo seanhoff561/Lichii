@@ -10,24 +10,49 @@
 
 namespace Tegra {
 
+/// How much faster Boost and Overclock make Switch 2 GPU work look.
+[[nodiscard]] constexpr u64 AmpereClockDivisor(Settings::GpuClock clock) {
+    switch (clock) {
+    case Settings::GpuClock::Boost:
+        return 4;
+    case Settings::GpuClock::Overclock:
+        return 16;
+    default:
+        return 1;
+    }
+}
+
+/// The last present's CoreTiming time and the GPU clock latched with it, packed into one word so
+/// both change together: a GPU Clocks change takes effect at the next present, never mid-frame.
+struct AmpereAnchor {
+    u64 bits{};
+
+    [[nodiscard]] static constexpr AmpereAnchor At(u64 present_ns, Settings::GpuClock clock) {
+        return {present_ns << 2 | static_cast<u64>(clock)};
+    }
+    [[nodiscard]] constexpr u64 PresentNs() const {
+        return bits >> 2;
+    }
+    [[nodiscard]] constexpr Settings::GpuClock Clock() const {
+        return static_cast<Settings::GpuClock>(bits & 3);
+    }
+};
+
+/// Switch 2 titles read report timestamps as nanoseconds and calibrate them against CPU time, so
+/// Boost and Overclock shrink only the time since the last present: GPU durations within a frame
+/// look shorter, while a timestamp never runs ahead of the CPU clock and trails it by less than
+/// the time since that present. Before the first present the clock is exact. Maxwell scales its
+/// ticks by the current clock.
 template <typename Timing>
-[[nodiscard]] u64 ReadGpuTimestamp(const Timing& timing, bool ampere, Settings::GpuClock clock) {
+[[nodiscard]] u64 ReadGpuTimestamp(const Timing& timing, bool ampere, Settings::GpuClock clock,
+                                   AmpereAnchor anchor) {
     if (ampere) {
-        // Switch 2 timestamps are wall-clock nanoseconds when the emulator handles the report,
-        // so a frame's GPU time reads as the emulator's whole frame time. Dynamic-resolution
-        // titles then pick their lowest resolution (Ocarina of Time: a third of the output).
-        // EDEN_NX2_GPU_TIME_SCALE=<n> makes time between reports n times shorter.
-        static const u64 scale = [] {
-            const char* value = std::getenv("EDEN_NX2_GPU_TIME_SCALE");
-            const u64 parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 1;
-            return parsed == 0 ? u64{1} : parsed;
-        }();
         const u64 now = static_cast<u64>(timing.GetGlobalTimeNs().count());
-        if (scale == 1) {
+        const u64 present_ns = anchor.PresentNs();
+        if (present_ns == 0 || now <= present_ns) {
             return now;
         }
-        static const u64 base = now;
-        return base + (now - base) / scale;
+        return present_ns + (now - present_ns) / AmpereClockDivisor(anchor.Clock());
     }
     const u64 ticks = timing.GetGPUTicks();
     switch (clock) {

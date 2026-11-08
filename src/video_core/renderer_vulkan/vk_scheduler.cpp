@@ -385,8 +385,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
         values[i] = clear_values[i];
     }
-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
-               vk::CommandBuffer cmdbuf) {
+    const bool after_compute = std::exchange(compute_writes_pending, false);
+    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
+            after_compute](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
@@ -400,6 +401,18 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             .clearValueCount = clear_value_count,
             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
         };
+        if (after_compute) {
+            // Draws read compute output as indirect arguments, vertices and resources; nothing
+            // else orders those reads after the dispatch.
+            static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
+        }
         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
     });
     num_renderpass_images = framebuffer->NumImages();
@@ -482,7 +495,14 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     const VkRenderPass renderpass = framebuffer->RenderPass();
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
+    // A draw continues the active pass whenever the same framebuffer and area are bound. The
+    // render-pass *variant* (a deferred clear's loadOp=CLEAR form) is only meaningful at begin -
+    // loadOps are applied once, and the base/variant passes are render-pass-compatible (only
+    // loadOp/storeOp differ). Comparing the exact handle here made every draw after a deferred
+    // clear restart the pass and re-LOAD what was just CLEARed (~118 MB of attachment traffic per
+    // world-target turn). The framebuffer handle already fixes the attachment structure and key,
+    // so it is the correct identity to compare.
+    if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         return;

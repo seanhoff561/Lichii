@@ -7,6 +7,9 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -81,11 +84,22 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPUHighPart(Settings::GpuHighPart::FenceDelay) : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        // A fence that writes a fence-flagged query report is never skipped as empty: a skipped
+        // fence runs its operation at once, before the host GPU has run the work the report
+        // follows, and Ocarina of Time then reads a wrong report (white flashes on leaves and walls
+        // at low GPU accuracy).
+        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
+                                 (Settings::IsGPUFenceBehaviorDefault()
+                                      ? Settings::IsGPUHighPart(Settings::GpuHighPart::FenceDelay)
+                                      : Settings::IsGPUFenceBehaviorBalanced() ||
+                                            Settings::IsGPUFenceBehaviorAccurate());
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
         auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        if (Nx2Profile::Enabled()) {
+            NoteFenceDecision(delay_fence, committed_flushes);
+        }
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
@@ -177,6 +191,9 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            // The fence's commands can be held back by a deferred flush that only this thread
+            // submits. The fencing thread waits for that submission before releasing the fence,
+            // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
             SubmitDeferredWork();
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
@@ -213,6 +230,7 @@ protected:
     virtual bool IsFenceSignaled(TFence& fence) const = 0;
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
+    /// Submits work whose submission the backend deferred (called before blocking on a fence).
     virtual void SubmitDeferredWork() {}
 
     VideoCore::RasterizerInterface& rasterizer;
@@ -390,6 +408,45 @@ private:
     /// titles have no queries or queued operations either. Making, queueing and retiring them
     /// cost the GPU thread ~5% and woke the fencing thread for each. One in 64 is still made, so
     /// the operations fences carry along (query slot cleanup) keep running.
+    // With the GPU profile on: why fences are made rather than skipped, logged every 5 s.
+    // Called before SkipEmptyFence, which it mirrors without changing its state.
+    void NoteFenceDecision(bool delay_fence, size_t committed_flushes) {
+        static std::array<u64, 6> counts{};
+        static auto since = std::chrono::steady_clock::now();
+        size_t reason = 5; // would be skipped
+        if (delay_fence) {
+            reason = 0;
+        } else if (committed_flushes != 0) {
+            reason = 1;
+        } else if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
+            if (skipped_fences >= 64) {
+                reason = 2;
+            } else if (query_cache.HasPendingFenceWork()) {
+                reason = 3;
+            } else {
+                std::scoped_lock lock{uncommitted_guard};
+                reason = uncommitted_operations.empty() ? 5 : 4;
+            }
+        } else {
+            reason = 2;
+        }
+        ++counts[reason];
+        const auto now = std::chrono::steady_clock::now();
+        const double window = std::chrono::duration<double>(now - since).count();
+        if (window < 5.0) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "Fence decisions/s: {:.0f} made (delayed fences {:.0f}, committed flushes {:.0f}, "
+                 "64-skip cap {:.0f}, query cache fence work {:.0f}, uncommitted operations "
+                 "{:.0f}), {:.0f} skipped",
+                 (counts[0] + counts[1] + counts[2] + counts[3] + counts[4]) / window,
+                 counts[0] / window, counts[1] / window, counts[2] / window, counts[3] / window,
+                 counts[4] / window, counts[5] / window);
+        counts = {};
+        since = now;
+    }
+
     bool SkipEmptyFence() {
         if constexpr (requires { query_cache.HasPendingFenceWork(); }) {
             if (skipped_fences >= 64 || query_cache.HasPendingFenceWork()) {

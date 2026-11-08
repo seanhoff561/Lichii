@@ -66,7 +66,7 @@ constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
 // Native shaders can reference more than 16 storage buffers. Dropping a binding
 // shifts all following descriptor payloads into the wrong descriptor types.
 constexpr u32 NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
-static_assert(NUM_STORAGE_BUFFERS <= 32, "storage binding masks must fit u32");
+static_assert(NUM_STORAGE_BUFFERS <= 64, "storage binding masks must fit u64");
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -152,10 +152,14 @@ public:
     const UniformBufferSizes* uniform_buffer_sizes{};
     const ComputeUniformBufferSizes* compute_uniform_buffer_sizes{};
 
-    std::array<u32, NUM_STAGES> enabled_storage_buffers{};
-    std::array<u32, NUM_STAGES> written_storage_buffers{};
-    u32 enabled_compute_storage_buffers = 0;
-    u32 written_compute_storage_buffers = 0;
+    std::array<u64, NUM_STAGES> enabled_storage_buffers{};
+    std::array<u64, NUM_STAGES> written_storage_buffers{};
+    u64 enabled_compute_storage_buffers = 0;
+    u64 written_compute_storage_buffers = 0;
+    // Bound by a native (Switch 2) compute program, whose pointers carry no size.
+    u64 native_compute_storage_buffers = 0;
+    // Bytes from each compute storage binding's start that a dispatch marks GPU-written.
+    std::array<u32, NUM_STORAGE_BUFFERS> compute_storage_write_marks{};
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -238,7 +242,8 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               u64 write_mark_limit = ~u64{0});
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
@@ -256,11 +261,27 @@ public:
     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
     void ClearDownload(DAddr base_addr, u64 size);
 
+    /// CPU writes collected but not yet applied (SetPendingCpuWrites).
+    [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
+
+    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
+                               const u8* data, u64 size);
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// The core consumed the read traps of these pages for a read the texture cache answered:
+    /// the next GPU write here must arm them again (GetFlushArea forgets them otherwise).
+    void ForgetReadTraps(DAddr device_addr, u64 size) {
+        read_trapped_ranges.Subtract(
+            Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE),
+            Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE) -
+                Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE));
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -302,8 +323,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// write_extent: how far the program's stores reach past the pointer (native programs).
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written, u32 indirect_offset = ~0U);
+                                  bool is_written, u32 indirect_offset = ~0U,
+                                  const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -318,6 +341,18 @@ public:
                                                           ObtainBufferSynchronize sync_info,
                                                           ObtainBufferOperation post_op);
     void FlushCachedWrites();
+
+    /// Where the CPU writes into GPU-written memory that were collected but not applied yet
+    /// (WriteMemory) come from: downloads must not write the GPU's older copy over them.
+    using PendingCpuWrites = std::function<void(const std::function<void(DAddr, size_t)>&)>;
+    void SetPendingCpuWrites(PendingCpuWrites source) {
+        pending_cpu_writes = std::move(source);
+    }
+
+    /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
+    /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
+    /// on the pages it writes).
+    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
 
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
@@ -350,13 +385,16 @@ public:
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
-    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
+    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
     /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
     /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
-    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
+    /// With `pending_tick`, a copy the GPU has not finished returns Pending and sets the tick
+    /// instead of waiting for it.
+    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                u64* pending_tick = nullptr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
 
@@ -449,8 +487,8 @@ public:
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
 private:
-    template <typename Func>
-    static void ForEachEnabledBit(u32 enabled_mask, Func&& func) {
+    template <typename Mask, typename Func>
+    static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
         for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
             const int disabled_bits = std::countr_zero(enabled_mask);
             index += disabled_bits;
@@ -708,10 +746,11 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        if (!read_trapped_ranges.Arm(begin, end - begin)) {
-            return;
-        }
-        device_memory.ArmReadTraps(begin, end - begin);
+        // Only the parts not armed yet: the core visits each page it is given, and a buffer the
+        // GPU rewrites every frame is mostly still armed (the guest read a few of its pages).
+        read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+            device_memory.ArmReadTraps(part, part_size);
+        });
     }
 
     ReadTrapTracker read_trapped_ranges;
@@ -729,6 +768,7 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;

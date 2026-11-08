@@ -250,30 +250,29 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    bool reset = in.reset;
-    bool options_changed = false;
-    if (!output_image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
-        in.upscale_size.width != upscale_extent.width ||
-        in.upscale_size.height != upscale_extent.height) {
+    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
+                                in.render_size.height != render_extent.height ||
+                                in.upscale_size.width != upscale_extent.width ||
+                                in.upscale_size.height != upscale_extent.height;
+    const bool options_changed = extent_changed || in.hdr != hdr_input;
+    const bool reset = in.reset || options_changed;
+    if (extent_changed) {
         CreateOutput(in.upscale_size);
         render_extent = in.render_size;
         upscale_extent = in.upscale_size;
-        options_changed = true;
-        reset = true;
     }
+    hdr_input = in.hdr;
 
-    // The game's own setup (Fortune's Weave: render-size motion vectors, reversed depth). Its
-    // colour is linear and goes above 1 with no exposure passed, so by default DLSS gets the HDR
-    // path with its own auto exposure. EDEN_NX2_DLSS_HDR=0 / EDEN_NX2_DLSS_AUTO_EXPOSURE=0 turn
-    // those off.
+    // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
+    // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
     options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
-    options.colorBuffersHDR = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
+    options.colorBuffersHDR =
+        in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
     options.useAutoExposure =
-        EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
+        in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
     const sl::DLSSPreset preset = Preset();
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
@@ -282,10 +281,10 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
     if (options_changed) {
-        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}",
+        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                  in.render_size.width, in.render_size.height, in.upscale_size.width,
-                 in.upscale_size.height, static_cast<int>(options.mode),
-                 static_cast<int>(preset));
+                 in.upscale_size.height, static_cast<int>(options.mode), static_cast<int>(preset),
+                 options.colorBuffersHDR == sl::eTrue ? "HDR" : "LDR");
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
@@ -350,6 +349,18 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         constants.jitterOffset = {in.jitter[0], in.jitter[1]};
         // Streamline wants motion in [-1,1] screen units; ours turns into render pixels.
         constants.mvecScale = {in.motion_vector_scale[0] / rw, in.motion_vector_scale[1] / rh};
+        constants.cameraPinholeOffset = {0.0f, 0.0f};
+        constants.cameraPos = {0.0f, 0.0f, 0.0f};
+        constants.cameraUp = {0.0f, 1.0f, 0.0f};
+        constants.cameraRight = {1.0f, 0.0f, 0.0f};
+        constants.cameraFwd = {0.0f, 0.0f, 1.0f};
+        constants.cameraNear = 0.1f;
+        constants.cameraFar = 1000.0f;
+        constants.cameraFOV = 1.0f;
+        constants.cameraAspectRatio = rw / rh;
+        constants.depthInverted = in.depth_inverted ? sl::eTrue : sl::eFalse;
+        constants.cameraMotionIncluded = sl::eTrue;
+        constants.motionVectors3D = sl::eFalse;
         constants.reset = reset ? sl::eTrue : sl::eFalse;
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,

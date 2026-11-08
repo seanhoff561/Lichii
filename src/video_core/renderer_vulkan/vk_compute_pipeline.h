@@ -52,11 +52,17 @@ public:
     ComputePipeline& operator=(const ComputePipeline&) = delete;
     ComputePipeline(const ComputePipeline&) = delete;
 
+    using BindCommand = std::function<void(vk::CommandBuffer)>;
+
     [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                  BufferCache& buffer_cache, TextureCache& texture_cache,
                                  TextureCacheRuntime& texture_runtime,
-                                 std::optional<ByteAddressedShadow>& shadow);
+                                 std::optional<ByteAddressedShadow>& shadow,
+                                 BindCommand* deferred_bind = nullptr);
+
+    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
+    [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);
@@ -84,6 +90,11 @@ public:
 
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
+
+    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    [[nodiscard]] bool IsBuildTaskDone() const noexcept {
+        return build_task_done.load(std::memory_order::acquire);
+    }
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
@@ -113,6 +124,7 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    std::atomic_bool build_task_done{true};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

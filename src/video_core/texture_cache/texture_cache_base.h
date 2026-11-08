@@ -16,6 +16,7 @@
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <vector>
@@ -44,6 +45,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -137,19 +139,21 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_expected_memory{};
     u64 budget_check_frames{};
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
+    u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
+    Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
-    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
-    /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
+    /// The most device memory the collector lets the cache fill before it collects in earnest on
+    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
@@ -217,6 +221,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     };
 
 public:
+    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
+    VideoCommon::PageFilter page_filter;
+
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
     /// Notify the cache that a new frame has been queued
@@ -230,6 +237,9 @@ public:
 
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
+
+    // Publish the CPU-readable collision image. Caller holds the cache mutex.
+    bool PublishComputeCollisionImage(u32 index);
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
@@ -388,7 +398,7 @@ private:
     void OnGPUASRegister(size_t map_id) final override;
 
     /// Runs the Garbage Collector.
-    void RunGarbageCollector();
+    void RunGarbageCollector(bool out_of_memory);
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
@@ -475,6 +485,9 @@ private:
     /// Unregister image from the page table
     void UnregisterImage(ImageId image);
 
+    /// Logs where UnregisterImage's image was registered when one of its pages is missing.
+    void ReportMissingImagePage(ImageId image_id, const Image& image, u64 page);
+
     /// Track CPU reads and writes for image
     void TrackImage(ImageBase& image, ImageId image_id);
 
@@ -517,6 +530,9 @@ private:
 
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
+
+    /// Returns true if the current clear's render area and scissor cover a width x height image
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
@@ -572,6 +588,21 @@ private:
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+
+    /// A GPU-written image dropped without being written back leaves its
+    /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept
+    /// tracked, so CPU writes, unmaps and write-backs clear them. An image made entirely on marked
+    /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
+    /// Switch 2 titles only: the buffer cache feeds Nx2MayBeGpuWritten for them alone.
+    void MarkStale(const ImageBase& image);
+    void ClearStale(DAddr addr, size_t size);
+    void ClearStaleImage(const ImageBase& image);
+    /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
+    void ClearStaleGpu(GPUVAddr gpu_addr, size_t size);
+    StalePages stale_pages;
+    u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
+    u64 tc_stale_skip_bytes{};
+    u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

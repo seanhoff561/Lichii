@@ -20,7 +20,7 @@
 
 namespace {
 
-// UsageTracker::Track before the full-page run.
+// UsageTracker::Track before the full-page run, with the same per-page masks.
 class OldUsageTracker {
     static constexpr size_t BUFFER_BYTES_PER_BITSHIFT = 6;
     static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
@@ -62,9 +62,14 @@ public:
 
 private:
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
+        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
+        const size_t num_bits = last_bit - first_bit + 1;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         pages[page] |= (~u64{0} & mask) << first_bit;
     }
@@ -228,6 +233,45 @@ TEST_CASE("Nx2Perf draw-binds: UsageTracker run matches the old Track", "[video_
         }
     }
     REQUIRE(std::ranges::equal(tracker.Pages(), old.pages));
+}
+
+TEST_CASE("Nx2Perf draw-binds: skipped UsageTracker resets match full resets", "[video_core]") {
+    constexpr u64 buffer_size = 4ULL << 20;
+    VideoCommon::UsageTracker tracker{buffer_size};
+    OldUsageTracker old{buffer_size};
+    tracker.Reset();
+    old.Reset();
+    REQUIRE(std::ranges::equal(tracker.Pages(), old.pages));
+
+    tracker.Track(PAGE, 3 * WORD + 64);
+    old.Track(PAGE, 3 * WORD + 64);
+    tracker.Reset();
+    old.Reset();
+    tracker.Reset();
+    old.Reset();
+    REQUIRE(std::ranges::all_of(tracker.Pages(), [](u64 word) { return word == 0; }));
+    REQUIRE_FALSE(tracker.IsUsed(PAGE, 64));
+    tracker.Track(PAGE, 3 * WORD + 64);
+    old.Track(PAGE, 3 * WORD + 64);
+    REQUIRE(std::ranges::equal(tracker.Pages(), old.pages));
+    REQUIRE(tracker.IsUsed(PAGE + WORD, 64));
+
+    std::mt19937_64 rng{0x040074A01BF12000ULL};
+    for (int step = 0; step < 20000; ++step) {
+        if (rng() % 3 == 0) {
+            tracker.Reset();
+            old.Reset();
+        } else {
+            const u64 offset = (rng() % (buffer_size / 64)) * 64;
+            u64 size = 64 * (1 + rng() % 4096);
+            if ((offset + size) % PAGE == 0) {
+                size += 64;
+            }
+            tracker.Track(offset, size);
+            old.Track(offset, size);
+        }
+        REQUIRE(std::ranges::equal(tracker.Pages(), old.pages));
+    }
 }
 
 TEST_CASE("Nx2Perf draw-binds: clean words", "[video_core]") {

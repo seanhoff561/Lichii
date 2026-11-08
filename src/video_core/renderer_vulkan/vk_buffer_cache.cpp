@@ -182,13 +182,21 @@ public:
     virtual ~QuadIndexBuffer() = default;
 
     void UpdateBuffer(u32 num_indices_) {
+        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
+            retired_buffers.erase(retired_buffers.begin());
+        }
         if (num_indices_ <= num_indices) {
             return;
         }
 
-        scheduler.Finish();
+        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
+        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
+        if (buffer) {
+            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        }
 
-        num_indices = num_indices_;
+        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
+        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
         index_type = IndexTypeFromNumElements(device, num_indices);
 
         const u32 num_quads = GetQuadsNum(num_indices);
@@ -279,6 +287,7 @@ protected:
     StagingBufferPool& staging_pool;
 
     vk::Buffer buffer{};
+    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
     MemoryCommit memory_commit{};
     VkIndexType index_type{};
     u32 num_indices = 0;
@@ -450,7 +459,12 @@ u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
     return static_cast<u32>(device.GetStorageBufferAlignment());
 }
 
+u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+    return device.GetMaxStorageBufferRange();
+}
+
 void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept {
+    multi_range_buffers.TickFrame(scheduler);
     for (auto it = slot_buffers.begin(); it != slot_buffers.end(); it++) {
         if (scheduler.IsFree(it->LastUsageTick())) {
             it->ResetUsageTracking();

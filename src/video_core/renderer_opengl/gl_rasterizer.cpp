@@ -18,6 +18,7 @@
 #include "common/math_util.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -398,6 +399,13 @@ void RasterizerOpenGL::DispatchCompute() {
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};
     if (!pipeline) {
+        // Native mode comes from the command stream (ChannelState::Init), not from the renderer,
+        // so a rejected program reaches this path here too. Report it as a failed dispatch like
+        // Vulkan does: KeplerCompute::DispatchNativeCompute treats a silent return as a skipped,
+        // successful dispatch.
+        if (kepler_compute->IsNativeMode()) {
+            throw Shader::RuntimeError("Native compute pipeline unavailable");
+        }
         return;
     }
     if (pipeline->UsesLocalMemory()) {
@@ -511,12 +519,19 @@ bool RasterizerOpenGL::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
-        }
+        texture_area = texture_cache.GetFlushArea(addr, size);
+    }
+    if (texture_area) {
+        // The core disarmed the read's pages before asking, and skips later reads in this area,
+        // even through another device alias of those pages. The buffer cache arms only pages it
+        // doesn't count as armed, so it must forget the whole area.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                     texture_area->end_address - texture_area->start_address);
+        return *texture_area;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};

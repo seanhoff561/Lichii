@@ -5,12 +5,14 @@
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
@@ -26,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
@@ -329,6 +332,8 @@ NvResult nvhost_as_gpu::Nx2GetSyncpointShimInfo(IoctlNx2SyncpointShimInfo& param
     return NvResult::Success;
 }
 
+/// Creates the GPU address space. Switch 2 page tables cover the VA given to NVN,
+/// which can extend past the va_range_end NvRm passed in.
 NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
     LOG_DEBUG(Service_NVDRV, "called, flags={:#x} big_page_size={:#x} va_range_start={:#x} va_range_end={:#x} va_range_split={:#x}", params.flags, params.big_page_size, params.va_range_start, params.va_range_end, params.va_range_split);
 
@@ -372,7 +377,12 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         }
     }
 
-    const u64 max_big_page_bits = Common::Log2Ceil(vm.va_range_end);
+    // NVN allocates from the range nx2:gpu reports, which extends past NvRm's va_range_end.
+    // Size the page tables for the wider range, or a map such as 0x2109ec0000 (Nintendo
+    // GameCube - Nintendo Classics) indexes off the end of entries[].
+    const u64 covered_end = g_nx2_driver ? std::max(vm.va_range_end, Tegra::Nx2GpuVaEnd)
+                                         : vm.va_range_end;
+    const u64 max_big_page_bits = Common::Log2Ceil(covered_end);
 
     const auto start_pages{static_cast<u32>(vm.va_range_start >> VM::PAGE_SIZE_BITS)};
     const auto end_pages{static_cast<u32>(vm.va_range_split >> VM::PAGE_SIZE_BITS)};
@@ -389,6 +399,8 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
     gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
     system.GPU().InitAddressSpace(*gmmu);
     vm.initialised = true;
+    LOG_INFO(Service_NVDRV, "GPU address space {} created: VA [{:#x}, {:#x}), big pages from {:#x}",
+             gmmu->GetID(), vm.va_range_start, vm.va_range_end, vm.va_range_split);
 
     return NvResult::Success;
 }
@@ -664,6 +676,8 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
 
     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
     gpu_channel_device->channel_state->memory_manager = gmmu.get();
+    LOG_INFO(Service_NVDRV, "Channel fd {} bound to GPU address space {}", static_cast<s32>(params.fd),
+             gmmu ? static_cast<s64>(gmmu->GetID()) : s64{-1});
     return NvResult::Success;
 }
 

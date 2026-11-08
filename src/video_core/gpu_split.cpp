@@ -121,6 +121,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
+    ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
@@ -474,7 +475,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
-    Common::ReserveCoreForCurrentThread();
+    if (Settings::values.pin_gpu_threads.GetValue()) {
+        Common::PinCurrentThread(Common::PinnedRole::GpuBack);
+    }
     system->RegisterHostThread();
 #ifdef _WIN32
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);

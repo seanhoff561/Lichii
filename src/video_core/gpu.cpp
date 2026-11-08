@@ -110,10 +110,19 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
-        });
+        std::vector<std::pair<DAddr, u64>> writes;
+        std::function<void(PAddr, size_t)> callback_writes(
+            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (!writes.empty()) {
+            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        }
+    }
+
+    void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+            manager.ForEachPending(callback);
+        }
     }
 
     /// Signal the ending of command list.
@@ -163,10 +172,15 @@ struct GPU::Impl {
 
     [[nodiscard]] u64 GetTicks() const {
         return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue());
+                                Settings::values.gpu_clock.GetValue(),
+                                ampere_anchor.load(std::memory_order_relaxed));
     }
 
     void RendererFrameEndNotify() {
+        ampere_anchor.store(
+            AmpereAnchor::At(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
+                             Settings::values.gpu_clock.GetValue()),
+            std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -365,6 +379,7 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
+    std::atomic<AmpereAnchor> ampere_anchor{};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
@@ -431,6 +446,10 @@ bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
         }
     }
     return false;
+}
+
+void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+    impl->ForEachPendingCpuWrite(callback);
 }
 
 void GPU::OnCommandListEnd() {
